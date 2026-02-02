@@ -146,7 +146,7 @@ class HexGridProcessor:
     def _map_trips_to_hex(self):
         """将CSV行程映射到网格"""
         print("Mapping trip data...")
-        df_trips = pd.read_csv(self.trip_data_path)
+        df_trips = pd.read_parquet(self.trip_data_path)
 
         # 辅助函数：ID -> 经纬度
         def get_coords(loc_id):
@@ -253,7 +253,7 @@ class PassengerSimulator:
 if __name__ == '__main__':
     # 示例配置
     SHAPEFILE_PATH = 'taxi_zones/taxi_zones.shp'
-    TRIP_DATA_PATH = 'fhvhv_jan_01.csv'  # 需确保文件存在
+    TRIP_DATA_PATH = 'fhv_tripdata_2025-01.parquet'  # 需确保文件存在
     HEX_RES = 7
 
     processor = HexGridProcessor(SHAPEFILE_PATH, TRIP_DATA_PATH, HEX_RES)

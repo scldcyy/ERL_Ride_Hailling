@@ -20,7 +20,7 @@ CONFIG = {
 
     # 数据与网格配置
     'SHAPEFILE_PATH': 'dataset/taxi_zones/taxi_zones.shp',  # 原始区域形状文件
-    'TRIP_DATA_PATH': 'dataset/fhvhv_jan_01.csv',  # 原始行程数据 (CSV格式)
+    'TRIP_DATA_PATH': 'dataset/fhv_tripdata_2025-01.parquet',  # 原始行程数据 (CSV格式)
     'HEX_RESOLUTION': 7,  # H3 网格分辨率
     'SAVE_DIR': 'model/generators'  # 模型保存路径
 }
