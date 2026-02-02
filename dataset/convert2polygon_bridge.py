@@ -5,7 +5,6 @@ import h3
 from shapely.geometry import Polygon, MultiPolygon
 import matplotlib.pyplot as plt
 import networkx as nx
-from collections import Counter
 
 
 class HexGridProcessor:
