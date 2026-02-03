@@ -15,12 +15,12 @@ from dataset.convert2polygon_bridge import HexGridProcessor, PassengerSimulator
 # --- 配置部分 ---
 CONFIG = {
     # 仿真环境参数 (用于计算缩放因子)
-    'N_DRIVERS': 1000,  # 仿真环境中的司机数量
+    'N_DRIVERS': 6000,  # 仿真环境中的司机数量
     'TRIPS_PER_DRIVER_DAY': 25,  # 期望每个司机每天完成的订单数 (用于控制总单量)
 
     # 数据与网格配置
     'SHAPEFILE_PATH': 'dataset/taxi_zones/taxi_zones.shp',  # 原始区域形状文件
-    'TRIP_DATA_PATH': 'dataset/fhv_tripdata_2025-01.parquet',  # 原始行程数据 (CSV格式)
+    'TRIP_DATA_PATH': 'dataset/fhvhv_tripdata_2024-01.parquet',  # 原始行程数据 (CSV格式)
     'HEX_RESOLUTION': 7,  # H3 网格分辨率
     'SAVE_DIR': 'model/generators'  # 模型保存路径
 }

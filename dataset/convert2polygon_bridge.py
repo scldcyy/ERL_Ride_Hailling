@@ -50,9 +50,8 @@ class HexGridProcessor:
         polys = list(unified_polygon.geoms) if isinstance(unified_polygon, MultiPolygon) else [unified_polygon]
 
         for poly in polys:
-            # 注意：h3.geo_to_h3shape 在新版可能有所不同，此处沿用旧版逻辑
             h3_poly = h3.geo_to_h3shape(poly)
-            cells = h3.polygon_to_cells(h3_poly, self.hex_resolution)
+            cells = h3.polygon_to_cells_experimental(h3_poly, self.hex_resolution,'bbox_overlap')
             hex_ids.update(cells)
 
         self._update_gdf_hex(hex_ids)
@@ -172,7 +171,7 @@ class HexGridProcessor:
 
     def process(self):
         self._generate_hex_grid()
-        self._bridge_disconnected_components()  # 调整距离参数
+        # self._bridge_disconnected_components()  # 调整距离参数
         self._build_adjacency_map()
         df_trips = self._map_trips_to_hex()
         return df_trips, self.gdf_hex
@@ -185,40 +184,46 @@ class PassengerSimulator:
         self.df = df_gridded_trips
         self.adjacency = adjacency
         self.scaling_factor = scaling_factor
-        self.demand_model = {}  # (hour, hex) -> lambda
-        self.transition_model = {}  # (hour, origin) -> ([destinations], [probs])
+        self.time_step = 10
+        self.demand_model = {}  # (time_step, hex) -> lambda
+        self.transition_model = {}  # (time_step, origin) -> ([destinations], [probs])
         self.trip_props_model = {}  # (origin, dest) -> {dist, duration}
 
         self.df['pickup_datetime'] = pd.to_datetime(self.df['pickup_datetime'])
-        self.df['hour'] = self.df['pickup_datetime'].dt.hour
+        self.df['minute_step'] = (self.df['pickup_datetime'].dt.hour* 60 + self.df['pickup_datetime'].dt.minute)//self.time_step
         self._learn_distributions()
+
+    def _estimate_ve(self):
+        pass
 
     def _learn_distributions(self):
         print("Learning demand distributions...")
         num_days = self.df['pickup_datetime'].dt.date.nunique() or 1
 
         # 1. 需求分布 (泊松参数 lambda)
-        demand_counts = self.df.groupby(['hour', 'pickup_hex_id']).size() / num_days
+        demand_counts = self.df.groupby(['minute_step', 'pickup_hex_id']).size() / num_days
         self.demand_model = demand_counts.to_dict()
 
         # 2. 转移概率 (Origin -> Destination)
-        transitions = self.df.groupby(['hour', 'pickup_hex_id', 'dropoff_hex_id']).size().reset_index(name='count')
-        for (hour, origin), group in transitions.groupby(['hour', 'pickup_hex_id']):
+        transitions = self.df.groupby(['minute_step', 'pickup_hex_id', 'dropoff_hex_id']).size().reset_index(name='count')
+        for (minute_step, origin), group in transitions.groupby(['minute_step', 'pickup_hex_id']):
             total = group['count'].sum()
-            self.transition_model[(hour, origin)] = (
+            self.transition_model[(minute_step, origin)] = (
                 group['dropoff_hex_id'].values,
                 group['count'].values / total
             )
 
         # 3. 行程属性 (距离和时间)
-        dist_col = 'trip_distance' if 'trip_distance' in self.df.columns else 'trip_miles'
-        dur_col = 'trip_duration' if 'trip_duration' in self.df.columns else 'trip_time'
+        dist_col = 'trip_miles'
+        dur_col = 'trip_time'
         self.trip_props_model = self.df.groupby(['pickup_hex_id', 'dropoff_hex_id'])[
             [dist_col, dur_col]].mean().to_dict('index')
+
 
     def generate_orders(self, time_slot, all_hex_ids):
         all_orders = []
         for hex_id in all_hex_ids:
+            # 估计泊松分布的均值
             lambda_val = self.demand_model.get((time_slot, hex_id), 0)
             if lambda_val <= 0: continue
 
@@ -234,8 +239,8 @@ class PassengerSimulator:
             for dest_hex in dests:
                 props = self.trip_props_model.get((hex_id, dest_hex), {'trip_distance': 1.0, 'trip_duration': 5})
                 # 兼容不同的列名
-                dist = props.get('trip_distance', props.get('trip_miles', 1.0))
-                dur = props.get('trip_duration', props.get('trip_time', 5.0))
+                dist = props.get('trip_miles', 1)
+                dur = props.get('trip_time', 10)//self.time_step
 
                 all_orders.append({
                     'origin_hex': hex_id,
@@ -253,7 +258,7 @@ class PassengerSimulator:
 if __name__ == '__main__':
     # 示例配置
     SHAPEFILE_PATH = 'taxi_zones/taxi_zones.shp'
-    TRIP_DATA_PATH = 'fhv_tripdata_2025-01.parquet'  # 需确保文件存在
+    TRIP_DATA_PATH = 'fhvhv_jan_01.parquet'  # 需确保文件存在
     HEX_RES = 7
 
     processor = HexGridProcessor(SHAPEFILE_PATH, TRIP_DATA_PATH, HEX_RES)
