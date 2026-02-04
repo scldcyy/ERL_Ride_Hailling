@@ -18,7 +18,7 @@ except ImportError:
 
 # --- Global Config ---
 CONFIG = {
-    'N_DRIVERS': 50,  # 仿真司机数 (需与 generate_split_simulators 中的 scaling 逻辑匹配)
+    'N_DRIVERS': 6000,  # 仿真司机数 (需与 generate_split_simulators 中的 scaling 逻辑匹配)
     'TIME_STEP_MINUTES': 10,  # 时间步长 10分钟
     'TIME_STEPS_PER_DAY': 144,  # 24 * 60 / 10 = 144 steps
 
@@ -567,5 +567,5 @@ if __name__ == '__main__':
         print("Please run generate_split_simulators.py first.")
     else:
         trainer = Trainer(simulator_path=sim_path)
-        rewards = trainer.train(platform_params, num_episodes=5)
+        rewards = trainer.train(platform_params, num_episodes=50)
         trainer.visualize_simulation(platform_params)
