@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import pickle
 import sys
+import h3
 
 # 引入项目根目录以导入 dataset 模块
 sys.path.append(os.getcwd())
@@ -18,7 +19,7 @@ except ImportError:
 
 # --- Global Config ---
 CONFIG = {
-    'N_DRIVERS': 6000,  # 仿真司机数 (需与 generate_split_simulators 中的 scaling 逻辑匹配)
+    'N_DRIVERS': 60,  # 仿真司机数 (需与 generate_split_simulators 中的 scaling 逻辑匹配)
     'TIME_STEP_MINUTES': 10,  # 时间步长 10分钟
     'TIME_STEPS_PER_DAY': 144,  # 24 * 60 / 10 = 144 steps
 
@@ -486,7 +487,7 @@ class Trainer:
             # Update Agent at end of episode
             self.agent.update()
             episode_rewards.append(ep_reward)
-        self._plot_rewards(episode_rewards)
+        # self._plot_rewards(episode_rewards)
         return episode_rewards
 
     def visualize_simulation(self, platform_params, filename="img/hex_simulation.gif"):
@@ -516,7 +517,6 @@ class Trainer:
         # Get Centroids for plotting
         # simulator.df contains explicit coords? No, Simulator has hex_ids.
         # We need h3 to lat/lng.
-        import h3
 
         # Precompute centroids for all zones
         centroids_dict = {}
@@ -568,4 +568,5 @@ if __name__ == '__main__':
     else:
         trainer = Trainer(simulator_path=sim_path)
         rewards = trainer.train(platform_params, num_episodes=50)
+        trainer.agent.save(trainer.checkpoint_path)
         trainer.visualize_simulation(platform_params)
