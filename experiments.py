@@ -4,169 +4,168 @@ import pandas as pd
 import seaborn as sns
 import os
 import sys
+from scipy.stats.qmc import LatinHypercube
+from tqdm import tqdm
 
-# 导入你的项目模块
-from main_ea import ERL_Solver, StatsTrainer, StrategyEncoder, evaluate_strategy_real
-from shared_ppo import CONFIG
+# 导入项目模块
+from main_ea import ERL_Solver, StatsTrainer, StrategyEncoder, evaluate_strategy_real, polynomial_mutation
+from shared_ppo import CONFIG, GreedyAgent
 
 # 样式设置
-sns.set_theme(style="whitegrid")
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 
 class ExperimentSuite:
-    def __init__(self, sim_path='model/generators/simulator_hex_weekday.pkl'):
+    def __init__(self, sim_path='model/generators/simulator_hex_scaling=0.010218823949614386_weekday.pkl'):
         self.sim_path = sim_path
         if not os.path.exists(self.sim_path):
             raise FileNotFoundError(f"Simulator not found at {self.sim_path}")
+        self.img_dir = 'img_experiments'
+        self.data_dir = 'data_experiments'
+        os.makedirs(self.img_dir, exist_ok=True)
+        os.makedirs(self.data_dir, exist_ok=True)
 
-    def run_baseline_comparison(self):
-        """
-        实验 1: 算法对比
-        对比:
-        1. Static Strategy (Fixed Params) + PPO Dispatch
-        2. Random Search (No Surrogate) + PPO Dispatch
-        3. Ours (Surrogate-Assisted ERL)
-        """
-        print("\n=== Experiment 1: Baseline Comparison ===")
+    def run_sota_comparison(self, max_gens=30, pop_size=10):
+        print(f"\n[Experiment 1] Running SOTA Comparison (Gens={max_gens}, Pop={pop_size})...")
         results = []
 
-        # 1. Static Strategy Baseline
-        # 固定参数: Commission=0.25, Surge=1.0, Subsidy=0.0
-        print("Running Baseline: Static Strategy...")
-        trainer = StatsTrainer(self.sim_path)
-        static_params = {'commission': 0.25,
-                         'lambda': np.full((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']), 1.0),
-                         'subsidy': np.zeros((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']))}
-        # 运行较长时间以模拟收敛
-        static_obj = trainer.train_and_evaluate(static_params, num_episodes=20)
-        # 将静态结果复制多次以便绘图对比
-        for g in range(30):
-            results.append({'Method': 'Static Baseline', 'Gen': g, 'Profit': static_obj[0]})
+        # --- Method 1: Vanilla PPO (Deep RL Baseline) ---
+        print(">>> Running Baseline 1: Vanilla PPO (Standard DRL)...")
+        trainer_ppo = StatsTrainer(self.sim_path)
+        # 固定参数 (Industry Standard)
+        fixed_params = {
+            'commission': 0.25,
+            'lambda': np.full((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']), 1.0),
+            'subsidy': np.zeros((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']))
+        }
 
-        # 2. Random Search (Ablation: No Surrogate, No Transfer)
-        print("Running Baseline: Random Search...")
-        solver_random = ERL_Solver(self.sim_path, pop_size=10, max_gens=30,
-                                   use_surrogate=False, use_transfer=False)
-        hist_random, _ = solver_random.solve()
-        for g, p in zip(hist_random['gen'], hist_random['best_profit']):
-            results.append({'Method': 'Random Search', 'Gen': g, 'Profit': p})
+        # 每一代训练量 = Pop_Size * Episodes_Per_Ind (这里设为5)
+        episodes_per_gen = pop_size * 5
 
-        # 3. Our Method (ERL)
-        print("Running Ours: ERL...")
-        solver_ours = ERL_Solver(self.sim_path, pop_size=10, max_gens=30,
-                                 use_surrogate=True, use_transfer=True)
-        hist_ours, _ = solver_ours.solve()
-        for g, p in zip(hist_ours['gen'], hist_ours['best_profit']):
-            results.append({'Method': 'Ours (ERL)', 'Gen': g, 'Profit': p})
+        # 记录初始性能
+        metrics = trainer_ppo.train_and_evaluate(fixed_params, num_episodes=5)
+        results.append(
+            {'Method': 'Vanilla PPO', 'Gen': 0, 'Profit': metrics[0], 'DriverInc': metrics[1], 'Quality': metrics[2]})
 
-        # 绘图
+        for g in tqdm(range(1, max_gens), desc="Vanilla PPO"):
+            # 训练一个 Generation 的量
+            metrics = trainer_ppo.train_and_evaluate(fixed_params, num_episodes=episodes_per_gen // 5)
+            results.append({'Method': 'Vanilla PPO', 'Gen': g, 'Profit': metrics[0], 'DriverInc': metrics[1],
+                            'Quality': metrics[2]})
+
+        # --- Method 2: GA-Greedy (Heuristic Baseline) ---
+        print(">>> Running Baseline 2: GA-Greedy (Evolution + Heuristic)...")
+        trainer_greedy = StatsTrainer(self.sim_path)
+        n_zones = trainer_greedy.env.n_zones
+        # 替换智能体为 GreedyAgent
+        trainer_greedy.agent = GreedyAgent(trainer_greedy.env.adjacency_indices, n_zones)
+
+        encoder = StrategyEncoder()
+        sampler = LatinHypercube(d=encoder.dim)
+        pop = sampler.random(n=pop_size) * (encoder.bounds[:, 1] - encoder.bounds[:, 0]) + encoder.bounds[:, 0]
+
+        for g in tqdm(range(max_gens), desc="GA-Greedy"):
+            gen_profits, gen_incomes, gen_qualities = [], [], []
+            for i in range(pop_size):
+                metrics, _ = evaluate_strategy_real(pop[i], trainer_greedy)
+                gen_profits.append(metrics[0])
+                gen_incomes.append(metrics[1])
+                gen_qualities.append(metrics[2])
+
+            best_idx = np.argmax(gen_profits)
+            results.append(
+                {'Method': 'GA-Greedy', 'Gen': g, 'Profit': gen_profits[best_idx], 'DriverInc': gen_incomes[best_idx],
+                 'Quality': gen_qualities[best_idx]})
+
+            # Simple Evolution
+            best_gene = pop[best_idx]
+            new_pop = [best_gene]
+            for _ in range(pop_size - 1):
+                new_pop.append(polynomial_mutation(best_gene, encoder.bounds, prob=1.0))
+            pop = np.array(new_pop)
+
+        # --- Method 3: H-ERL (Ours) ---
+        print(">>> Running Ours: H-ERL (Hybrid)...")
+        solver = ERL_Solver(self.sim_path, pop_size=pop_size, max_gens=max_gens, use_surrogate=True, use_transfer=True)
+        hist, full_archive = solver.solve()
+
+        for g, p, inc in zip(hist['gen'], hist['best_profit'], hist['avg_driver_inc']):
+            # history 字典里没有 Quality 字段，此处为演示保持一致性填0，实际可修改 ERL_Solver 记录
+            results.append({'Method': 'H-ERL (Ours)', 'Gen': g, 'Profit': p, 'DriverInc': inc, 'Quality': 0})
+
+        # --- Plotting ---
         df = pd.DataFrame(results)
-        plt.figure(figsize=(10, 6))
-        sns.lineplot(data=df, x='Gen', y='Profit', hue='Method', marker='o')
-        plt.title('Convergence Comparison: Platform Profit')
-        plt.ylabel('Max Profit ($)')
-        plt.xlabel('Generation')
-        plt.savefig('img/exp1_baseline_comparison.png')
-        print("Saved img/exp1_baseline_comparison.png")
+        df.to_csv(f"{self.data_dir}/sota_results.csv", index=False)
 
-    def run_ablation_study(self):
-        """
-        实验 2: 消融实验
-        验证 Transfer Learning 的有效性
-        """
-        print("\n=== Experiment 2: Ablation Study (Transfer Learning) ===")
+        plt.figure(figsize=(10, 6))
+        sns.lineplot(data=df, x='Gen', y='Profit', hue='Method', style='Method', markers=True, linewidth=2.5)
+        plt.title('Convergence Comparison: Platform Profit')
+        plt.savefig(f"{self.img_dir}/exp1_sota_convergence.png", dpi=300)
+        print(f"Saved {self.img_dir}/exp1_sota_convergence.png")
+
+    def run_ablation_study(self, max_gens=20, pop_size=10):
+        print(f"\n[Experiment 2] Running Ablation Study...")
         results = []
 
-        # 1. With Transfer (Ours)
-        # (复用上面的数据，或者重跑)
-        print("Running: With Transfer...")
-        solver_transfer = ERL_Solver(self.sim_path, pop_size=10, max_gens=20, use_transfer=True)
-        hist_t, _ = solver_transfer.solve()
+        # Config 1: w/ Transfer
+        solver_w = ERL_Solver(self.sim_path, pop_size=pop_size, max_gens=max_gens, use_surrogate=True,
+                              use_transfer=True)
+        hist_w, _ = solver_w.solve()
+        for g, p in zip(hist_w['gen'], hist_w['best_profit']):
+            results.append({'Config': 'H-ERL (Full)', 'Gen': g, 'Profit': p})
 
-        # 2. Without Transfer
-        print("Running: Without Transfer...")
-        solver_no_transfer = ERL_Solver(self.sim_path, pop_size=10, max_gens=20, use_transfer=False)
-        hist_nt, _ = solver_no_transfer.solve()
-
-        # 整理数据
-        for i in range(len(hist_t['gen'])):
-            results.append({'Config': 'w/ Transfer (Ours)', 'Gen': i, 'Profit': hist_t['best_profit'][i]})
-            results.append({'Config': 'w/o Transfer', 'Gen': i, 'Profit': hist_nt['best_profit'][i]})
+        # Config 2: w/o Transfer
+        solver_wo = ERL_Solver(self.sim_path, pop_size=pop_size, max_gens=max_gens, use_surrogate=True,
+                               use_transfer=False)
+        hist_wo, _ = solver_wo.solve()
+        for g, p in zip(hist_wo['gen'], hist_wo['best_profit']):
+            results.append({'Config': 'w/o Transfer', 'Gen': g, 'Profit': p})
 
         df = pd.DataFrame(results)
         plt.figure(figsize=(10, 6))
         sns.lineplot(data=df, x='Gen', y='Profit', hue='Config', style='Config', markers=True)
-        plt.title('Ablation Study: Effectiveness of Transfer Learning')
-        plt.savefig('img/exp2_ablation_transfer.png')
-        print("Saved img/exp2_ablation_transfer.png")
+        plt.title('Ablation Study: Transfer Learning')
+        plt.savefig(f"{self.img_dir}/exp2_ablation.png", dpi=300)
+        print(f"Saved {self.img_dir}/exp2_ablation.png")
 
     def run_scalability_test(self):
-        """
-        实验 3: 规模扩展性
-        改变 CONFIG['N_DRIVERS'] 观察性能
-        注意: 这需要重新修改全局 CONFIG，可能需要重载环境
-        """
-        print("\n=== Experiment 3: Scalability Test ===")
+        print(f"\n[Experiment 3] Scalability Test...")
         driver_counts = [2000, 4000, 6000]
-        final_profits = []
-        final_incomes = []
-
+        summary = []
         original_n = CONFIG['N_DRIVERS']
 
         try:
-            for n_drivers in driver_counts:
-                print(f"Testing Scale: {n_drivers} Drivers...")
-                # 动态修改全局配置
-                CONFIG['N_DRIVERS'] = n_drivers
-
-                # 运行简短的 ERL
-                solver = ERL_Solver(self.sim_path, pop_size=5, max_gens=10)
+            for n in driver_counts:
+                CONFIG['N_DRIVERS'] = n
+                # 使用较小的参数快速验证
+                solver = ERL_Solver(self.sim_path, pop_size=5, max_gens=5, use_surrogate=False, use_transfer=True)
                 _, archive_Y = solver.solve()
-
-                # 取 Pareto 前沿的平均值或最大值
-                best_profit = np.max(archive_Y[:, 0])
-                avg_income = np.mean(archive_Y[:, 1])
-
-                final_profits.append(best_profit)
-                final_incomes.append(avg_income)
-
+                summary.append({
+                    'Drivers': n,
+                    'MaxProfit': np.max(archive_Y[:, 0]),
+                    'AvgDriverInc': np.mean(archive_Y[:, 1])
+                })
         finally:
-            # 还原配置
             CONFIG['N_DRIVERS'] = original_n
 
-        # 双轴绘图
+        df = pd.DataFrame(summary)
         fig, ax1 = plt.subplots(figsize=(10, 6))
-
-        color = 'tab:red'
-        ax1.set_xlabel('Number of Drivers')
-        ax1.set_ylabel('Platform Profit ($)', color=color)
-        ax1.plot(driver_counts, final_profits, color=color, marker='o', label='Profit')
-        ax1.tick_params(axis='y', labelcolor=color)
-
+        ax1.set_xlabel('Drivers')
+        ax1.set_ylabel('Profit', color='tab:blue')
+        sns.lineplot(data=df, x='Drivers', y='MaxProfit', marker='o', color='tab:blue', ax=ax1)
         ax2 = ax1.twinx()
-        color = 'tab:blue'
-        ax2.set_ylabel('Avg Driver Income ($)', color=color)
-        ax2.plot(driver_counts, final_incomes, color=color, marker='s', linestyle='--', label='Driver Income')
-        ax2.tick_params(axis='y', labelcolor=color)
-
-        plt.title('Scalability Analysis: Performance vs Problem Size')
-        fig.tight_layout()
-        plt.savefig('img/exp3_scalability.png')
-        print("Saved img/exp3_scalability.png")
+        ax2.set_ylabel('Driver Income', color='tab:orange')
+        sns.lineplot(data=df, x='Drivers', y='AvgDriverInc', marker='s', color='tab:orange', ax=ax2)
+        plt.title('Scalability Analysis')
+        plt.savefig(f"{self.img_dir}/exp3_scalability.png", dpi=300)
+        print(f"Saved {self.img_dir}/exp3_scalability.png")
 
 
 if __name__ == "__main__":
-    # 确保保存目录存在
-    if not os.path.exists('img'):
-        os.makedirs('img')
-
     suite = ExperimentSuite()
-
-    # 建议依次运行，或者注释掉不想跑的部分
-    # 注意：运行完整的实验非常耗时，可以减少 max_gens 和 pop_size 进行代码测试
-
-    suite.run_baseline_comparison()
-    suite.run_ablation_study()
+    # 依次运行所有实验
+    suite.run_sota_comparison(max_gens=30, pop_size=10)
+    suite.run_ablation_study(max_gens=20, pop_size=10)
     suite.run_scalability_test()

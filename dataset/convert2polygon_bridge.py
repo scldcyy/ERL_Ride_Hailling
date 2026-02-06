@@ -190,6 +190,7 @@ class PassengerSimulator:
         self.trip_props_model = {}  # (origin, dest) -> {dist, duration}
 
         self.df['pickup_datetime'] = pd.to_datetime(self.df['pickup_datetime'])
+
         self.df['minute_step'] = (self.df['pickup_datetime'].dt.hour* 60 + self.df['pickup_datetime'].dt.minute)//self.time_step
         self._learn_distributions()
 

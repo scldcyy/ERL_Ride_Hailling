@@ -4,28 +4,29 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
 import pickle
 import sys
 import h3
 
 # 引入项目根目录以导入 dataset 模块
 sys.path.append(os.getcwd())
+# 尝试导入 PassengerSimulator
 try:
     from dataset.convert2polygon_bridge import PassengerSimulator
 except ImportError:
-    print("WARNING: Could not import PassengerSimulator. Ensure 'dataset' folder is in path.")
+    pass
 
 # --- Global Config ---
 CONFIG = {
-    'N_DRIVERS': 60,  # 仿真司机数 (需与 generate_split_simulators 中的 scaling 逻辑匹配)
-    'TIME_STEP_MINUTES': 10,  # 时间步长 10分钟
-    'TIME_STEPS_PER_DAY': 144,  # 24 * 60 / 10 = 144 steps
+    'N_DRIVERS': 60,
+    'TIME_STEP_MINUTES': 10,
+    'TIME_STEPS_PER_DAY': 144,
 
     # RL Params
-    'HIDDEN_DIM': 256,  # 增大网络以适应更大的 Hex 空间
-    'STATE_DIM':7,  # 增加状态维度: [Loc(1), Time(1), OrderCount(1), DriverCount(1), AvgNeighborOrders(1), AvgNeighborDrivers(1), LockingStatus(1)]
+    'HIDDEN_DIM': 256,
+    'STATE_DIM': 7,
     'LR_ACTOR': 0.0003,
     'LR_CRITIC': 0.001,
     'GAMMA': 0.99,
@@ -35,10 +36,13 @@ CONFIG = {
 
     # Economics
     'BASE_FARE': 2.5,
-    'PRICE_PER_MINUTE': 0.5,  # 修改为按分钟计费更符合 10min 步长逻辑
+    'PRICE_PER_MINUTE': 0.5,
     'OPPORTUNITY_COST_PER_STEP': 0.1,
     'REPOSITION_COST_PER_STEP': 0.2,
     'IDLE_REWARD': -0.05,
+
+    # [新增] 司机保护机制：每单最低净收入（不含成本扣除前的到手现金）
+    'MIN_DRIVER_EARNING_PER_TRIP': 2.0
 }
 
 
@@ -48,8 +52,6 @@ class RideHailingEnv:
         with open(simulator_path, 'rb') as f:
             self.simulator = pickle.load(f)
 
-        # 1. 建立 Hex ID <-> Integer Index 映射
-        # 获取所有可能的 Hex ID (来自邻接表)
         self.all_hexes = list(self.simulator.adjacency.keys())
         self.n_zones = len(self.all_hexes)
         self.hex_to_idx = {h: i for i, h in enumerate(self.all_hexes)}
@@ -57,12 +59,9 @@ class RideHailingEnv:
 
         print(f"Environment initialized with {self.n_zones} Hex Zones.")
 
-        # 更新 CONFIG
         CONFIG['N_ZONES'] = self.n_zones
-        CONFIG['ACTION_DIM'] = self.n_zones + 1  # Action 0 = Stay/Serve, 1..N = Move to Zone i-1
+        CONFIG['ACTION_DIM'] = self.n_zones + 1
 
-        # 2. 预计算邻接索引 (用于加速 step 和 mask)
-        # self.adjacency_indices[i] 包含索引 i 的所有邻居索引列表
         self.adjacency_indices = {}
         for h_id, neighbors in self.simulator.adjacency.items():
             if h_id in self.hex_to_idx:
@@ -70,42 +69,38 @@ class RideHailingEnv:
                 n_indices = [self.hex_to_idx[n] for n in neighbors if n in self.hex_to_idx]
                 self.adjacency_indices[idx] = n_indices
 
+        # 初始化统计变量
+        self.total_revenue = 0
+        self.total_served_orders = 0
+        self.total_wait_time = 0
+        self.pending_orders = []
+
     def reset(self):
         self.time = 0
-        # 随机初始化位置
         self.driver_locations = np.random.randint(0, self.n_zones, size=CONFIG['N_DRIVERS'])
-
-        # 司机状态: 0=Idle, 1=Busy/Moving
-        self.driver_status = np.zeros(CONFIG['N_DRIVERS'], dtype=int)
-
-        # 锁定时间: 剩余多少个时间步才能变为空闲
+        self.driver_status = np.zeros(CONFIG['N_DRIVERS'], dtype=int)  # 0=Idle, 1=Busy
         self.driver_free_time = np.zeros(CONFIG['N_DRIVERS'], dtype=int)
 
-        # 统计
-        self.driver_rewards = np.zeros(CONFIG['N_DRIVERS'])
         self.total_revenue = 0
-        self.pending_orders = []  # 存储当前步的订单字典
+        self.total_served_orders = 0
+        self.total_wait_time = 0
+        self.pending_orders = []
 
         return self._get_state()
 
     def _get_state(self):
-        # 1. 聚合订单信息
         order_counts = np.zeros(self.n_zones)
         for o in self.pending_orders:
             if not o['matched']:
                 order_counts[o['origin_idx']] += 1
 
-        # 2. 聚合空闲司机信息
         idle_mask = (self.driver_status == 0)
         idle_driver_counts = np.bincount(self.driver_locations[idle_mask], minlength=self.n_zones)
 
         states = np.zeros((CONFIG['N_DRIVERS'], CONFIG['STATE_DIM']))
 
-        # 3. 构造每个司机的状态向量
         for i in range(CONFIG['N_DRIVERS']):
             loc = self.driver_locations[i]
-
-            # 获取邻居信息
             neighbors = self.adjacency_indices.get(loc, [])
             if neighbors:
                 avg_n_orders = order_counts[neighbors].mean()
@@ -115,51 +110,36 @@ class RideHailingEnv:
                 avg_n_drivers = 0
 
             states[i] = [
-                loc / self.n_zones,  # Normalize Location ID (simple scaling)
-                self.time / CONFIG['TIME_STEPS_PER_DAY'],  # Normalize Time
+                loc / self.n_zones,
+                self.time / CONFIG['TIME_STEPS_PER_DAY'],
                 order_counts[loc],
                 idle_driver_counts[loc],
                 avg_n_orders,
                 avg_n_drivers,
-                self.driver_free_time[i]  # 告知 Agent 自己是否被锁定
+                1.0 if self.driver_free_time[i] > 0 else 0.0  # Locking Status
             ]
         return states
 
     def get_valid_actions_mask(self):
-        """
-        生成动作掩码。
-        返回: (N_DRIVERS, ACTION_DIM) 的布尔矩阵。True表示动作有效。
-        逻辑: 司机只能选择 Stay(0) 或者移动到邻接网格对应的 Index+1。
-        """
         mask = np.zeros((CONFIG['N_DRIVERS'], CONFIG['ACTION_DIM']), dtype=bool)
-
-        # 动作 0 (Stay/Serve Local) 总是有效的
-        mask[:, 0] = True
-
+        mask[:, 0] = True  # Stay is always valid
         for i in range(CONFIG['N_DRIVERS']):
             loc = self.driver_locations[i]
             neighbors = self.adjacency_indices.get(loc, [])
-            # Action index = target_zone_idx + 1
             valid_action_indices = [n + 1 for n in neighbors]
             mask[i, valid_action_indices] = True
-
         return mask
 
     def step(self, actions, platform_params):
-        # --- 1. 时间流逝与状态解锁 ---
-        # 减少所有忙碌司机的锁定时间
+        # 1. 解锁司机
         self.driver_free_time[self.driver_free_time > 0] -= 1
-
-        # 如果锁定时间归零，且之前是忙碌状态，则变为空闲
         freed_drivers = np.where((self.driver_status == 1) & (self.driver_free_time == 0))[0]
         self.driver_status[freed_drivers] = 0
 
-        # --- 2. 生成新订单 ---
-        # 模拟器生成的是 hex_id，需要转换为 idx
+        # 2. 生成新订单
         raw_orders = self.simulator.generate_orders(self.time, self.all_hexes)
         new_orders = []
         for o in raw_orders:
-            # 过滤掉不在地图映射中的异常点
             if o['origin_hex'] in self.hex_to_idx and o['dest_hex'] in self.hex_to_idx:
                 o['origin_idx'] = self.hex_to_idx[o['origin_hex']]
                 o['dest_idx'] = self.hex_to_idx[o['dest_hex']]
@@ -167,130 +147,185 @@ class RideHailingEnv:
                 o['wait_time'] = 0
                 new_orders.append(o)
 
-        # 将上一轮未匹配的订单保留 (可增加超时丢弃逻辑)
-        self.pending_orders = [o for o in self.pending_orders if not o['matched'] and o['wait_time'] < 3]  # 最多等3个step
-        for o in self.pending_orders: o['wait_time'] += 1
+        # 订单积压处理 (超过3个step未接单则取消)
+        self.pending_orders = [o for o in self.pending_orders if not o['matched'] and o['wait_time'] < 3]
+        for o in self.pending_orders:
+            o['wait_time'] += 1
+            self.total_wait_time += 1  # 累积等待惩罚
+
         self.pending_orders.extend(new_orders)
 
         rewards = np.zeros(CONFIG['N_DRIVERS'])
 
-        # --- 3. 执行动作 (仅对空闲司机) ---
-        # 这里的 actions 是 Agent 输出的，对于被锁定的司机，动作会被忽略
-        idle_indices = np.where(self.driver_status == 0)[0]
+        # 统计本时间步的财务数据
+        step_implicit_subsidy = 0.0  # 低保填坑成本
+        step_explicit_subsidy = 0.0  # 策略生成的补贴成本
 
-        # 打乱顺序，避免低 ID 司机总是优先抢单
+        # 3. 执行动作
+        idle_indices = np.where(self.driver_status == 0)[0]
         np.random.shuffle(idle_indices)
 
         for i in idle_indices:
             action = actions[i]
             current_loc = self.driver_locations[i]
 
-            if action == 0:  # 尝试接单 (Serve)
-                # 查找当前位置的可用订单
-                local_orders = [o for o in self.pending_orders
-                                if o['origin_idx'] == current_loc and not o['matched']]
-
+            if action == 0:  # Serve
+                local_orders = [o for o in self.pending_orders if o['origin_idx'] == current_loc and not o['matched']]
                 if local_orders:
-                    # 接单成功
                     order = local_orders[0]
                     order['matched'] = True
+                    self.total_served_orders += 1
 
-                    # 收益计算: 基础费 + 时长费 (模拟) * 抽成
-                    # 注意: simulator 返回的 duration 已经是 step 数
                     trip_steps = max(1, int(order['duration']))
-                    fare = CONFIG['BASE_FARE'] + trip_steps * CONFIG['TIME_STEP_MINUTES'] * CONFIG['PRICE_PER_MINUTE']
 
-                    # 计算奖励 (纯利)
-                    income = fare * (1 - platform_params['commission'])
-                    cost = trip_steps * CONFIG['OPPORTUNITY_COST_PER_STEP']
-                    rewards[i] = income - cost
+                    # --- 改进后的经济模型 ---
+                    # 1. 动态定价 (Surge)
+                    surge_multiplier = platform_params['lambda'][self.time, current_loc]
+                    fare_base = (CONFIG['BASE_FARE'] + trip_steps * CONFIG['TIME_STEP_MINUTES'] * CONFIG[
+                        'PRICE_PER_MINUTE'])
+                    gross_fare = fare_base * surge_multiplier
 
-                    # 更新状态
-                    self.driver_status[i] = 1  # Set to Busy
-                    self.driver_free_time[i] = trip_steps  # 锁定 N 个 step
-                    self.driver_locations[i] = order['dest_idx']  # 逻辑上直接设为终点(简化)
-                    self.total_revenue += income
-                else:
-                    # 没有订单，Idle Penalty
-                    rewards[i] = CONFIG['IDLE_REWARD']
+                    # 2. 显性补贴 (Explicit Subsidy from Strategy)
+                    explicit_sub = platform_params['subsidy'][self.time, current_loc]
+                    step_explicit_subsidy += explicit_sub
 
-            else:  # 再定位 (Reposition)
-                target_idx = action - 1
+                    # 3. 司机理论收入 (Nominal Income)
+                    driver_nominal_income = gross_fare * (1 - platform_params['commission']) + explicit_sub
 
-                # 检查合法性 (虽然有 Mask，但双重保险)
-                neighbors = self.adjacency_indices.get(current_loc, [])
+                    # 4. 最低收入保护 (Min-Fare Protection)
+                    driver_actual_income = max(driver_nominal_income, CONFIG['MIN_DRIVER_EARNING_PER_TRIP'])
 
-                if target_idx in neighbors:
-                    # 移动成功
-                    # 假设移动到邻居需要 1 个 time step (10 mins)
-                    move_steps = 1
-                    cost = CONFIG['REPOSITION_COST_PER_STEP']
-                    rewards[i] = -cost
+                    # 5. 计算隐性补贴 (Implicit Subsidy / Gap Filling)
+                    gap = driver_actual_income - driver_nominal_income
+                    if gap > 0:
+                        step_implicit_subsidy += gap
+
+                    # 6. 司机最终 Reward (净收入 - 运营成本)
+                    op_cost = trip_steps * CONFIG['OPPORTUNITY_COST_PER_STEP']
+                    rewards[i] = driver_actual_income - op_cost
 
                     self.driver_status[i] = 1
-                    self.driver_free_time[i] = move_steps
+                    self.driver_free_time[i] = trip_steps
+                    self.driver_locations[i] = order['dest_idx']
+                    self.total_revenue += gross_fare
+                else:
+                    rewards[i] = CONFIG['IDLE_REWARD']
+
+            else:  # Reposition
+                target_idx = action - 1
+                neighbors = self.adjacency_indices.get(current_loc, [])
+                if target_idx in neighbors:
+                    rewards[i] = -CONFIG['REPOSITION_COST_PER_STEP']
+                    self.driver_status[i] = 1
+                    self.driver_free_time[i] = 1
                     self.driver_locations[i] = target_idx
                 else:
-                    # 非法移动 (Mask 应该防止这种情况，但如果发生了...)
-                    rewards[i] = -0.5  # 惩罚
+                    rewards[i] = -0.5  # 非法移动惩罚
 
-        # --- 4. 推进时间 ---
         self.time += 1
         done = (self.time >= CONFIG['TIME_STEPS_PER_DAY'])
 
-        return self._get_state(), rewards, done, {}
+        # Info 用于传递统计数据
+        info = {
+            'total_wait_time': self.total_wait_time,
+            'total_served': self.total_served_orders,
+            'total_revenue': self.total_revenue,
+            'step_implicit_subsidy': step_implicit_subsidy,
+            'step_explicit_subsidy': step_explicit_subsidy
+        }
+
+        return self._get_state(), rewards, done, info
 
 
-# --- PPO Components (Added Masking) ---
+# --- Greedy Agent (Baseline SOTA) ---
+class GreedyAgent:
+    def __init__(self, adjacency_indices, n_zones):
+        self.adjacency_indices = adjacency_indices
+        self.n_zones = n_zones
+        self.buffer = type('Buffer', (object,), {
+            'rewards': [], 'is_terminals': [], 'states': [], 'actions': [], 'logprobs': [], 'masks': [],
+            'clear': lambda: None
+        })()
+        self.policy = type('Policy', (object,), {
+            'state_dict': lambda: {},
+            'load_state_dict': lambda x: None,
+            'eval': lambda: None
+        })()
+        self.policy_old = self.policy
 
+    def select_actions(self, states, action_mask):
+        n_drivers = states.shape[0]
+        actions = np.zeros(n_drivers, dtype=int)
+
+        local_orders = states[:, 2]
+        avg_neighbor_orders = states[:, 4]
+
+        for i in range(n_drivers):
+            if not action_mask[i, 0]:
+                continue
+
+            if local_orders[i] >= 1.0:
+                actions[i] = 0
+            else:
+                if avg_neighbor_orders[i] > 0.5 and avg_neighbor_orders[i] > local_orders[i]:
+                    valid_moves = [idx for idx in np.where(action_mask[i])[0] if idx != 0]
+                    if valid_moves:
+                        actions[i] = np.random.choice(valid_moves)
+                    else:
+                        actions[i] = 0
+                else:
+                    actions[i] = 0
+        return actions
+
+    def update(self):
+        self.buffer.rewards = []
+        self.buffer.is_terminals = []
+
+    def save(self, p):
+        pass
+
+    def load_by_weights(self, w):
+        pass
+
+    def get_weights(self):
+        return None
+
+    def eval(self):
+        pass
+
+
+# --- PPO Components ---
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super(ActorCritic, self).__init__()
-        # Critic
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.Linear(state_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
-        # Actor
         self.actor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.Linear(state_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, action_dim)
         )
 
     def act(self, state, action_mask=None):
-        """
-        state: (Batch, State_Dim)
-        action_mask: (Batch, Action_Dim) - True for valid actions
-        """
         action_logits = self.actor(state)
-
         if action_mask is not None:
-            # 将无效动作的 logits 设为极小的负数
             action_logits = action_logits.masked_fill(~action_mask, -1e8)
-
         dist = Categorical(logits=action_logits)
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-
         return action.detach(), action_logprob.detach()
 
     def evaluate(self, state, action, action_mask=None):
         action_logits = self.actor(state)
-
         if action_mask is not None:
             action_logits = action_logits.masked_fill(~action_mask, -1e8)
-
         dist = Categorical(logits=action_logits)
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
         state_values = self.critic(state)
-
         return action_logprobs, state_values, dist_entropy
 
 
@@ -301,7 +336,7 @@ class RolloutBuffer:
         self.logprobs = []
         self.rewards = []
         self.is_terminals = []
-        self.masks = []  # Store masks for update
+        self.masks = []
 
     def clear(self):
         del self.actions[:]
@@ -320,7 +355,6 @@ class SharedPPOAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.buffer = RolloutBuffer()
         self.MseLoss = nn.MSELoss()
-
         self.gamma = hyperparameters['GAMMA']
         self.gae_lambda = hyperparameters['GAE_LAMBDA']
         self.K_epochs = hyperparameters['K_EPOCHS']
@@ -331,50 +365,26 @@ class SharedPPOAgent:
             states = torch.FloatTensor(states)
             mask = torch.BoolTensor(action_mask)
             actions, logprobs = self.policy_old.act(states, mask)
-
         self.buffer.states.append(states)
         self.buffer.actions.append(actions)
         self.buffer.logprobs.append(logprobs)
-        self.buffer.masks.append(mask)  # 保存 Mask 用于 Update
-
+        self.buffer.masks.append(mask)
         return actions.numpy()
 
     def update(self):
-        # Flatten buffers
         old_states = torch.cat(self.buffer.states).detach()
         old_actions = torch.cat(self.buffer.actions).detach()
         old_logprobs = torch.cat(self.buffer.logprobs).detach()
         old_masks = torch.cat(self.buffer.masks).detach()
 
-        # Monte Carlo estimate of returns
-        rewards = []
-        discounted_reward = 0
-        # Flatten rewards list of lists
-        flat_rewards = []
-        flat_terminals = []
-        for step_rewards in self.buffer.rewards:
-            flat_rewards.extend(step_rewards)
-        for step_dones in self.buffer.is_terminals:
-            # done is scalar per step usually in single env, but here we have multi-agent step
-            # Assume is_terminals stores boolean scalars for the whole env?
-            # Based on Trainer, done is scalar. But rewards is (N_DRIVERS,)
-            # We need to structure advantages correctly.
-            pass
-
-        # Simplified GAE calculation (Batch-based)
-        # Assuming buffer stores [Step1_Rewards(N), Step2_Rewards(N)...]
-        # We process each agent's trajectory?
-        # Since it's Shared PPO with random matching, we can treat (State, Action, Reward) as independent samples
-        # or grouped by time. For simplicity in this heavy masking env, standard batch GAE:
-
-        # Convert list of arrays to tensor: (Time, N_Drivers)
+        rewards_flat = []
+        for r_step in self.buffer.rewards:
+            rewards_flat.extend(r_step)
         rewards_tensor = torch.tensor(np.array(self.buffer.rewards), dtype=torch.float32)
 
-        # Calculate State Values
         with torch.no_grad():
             values = self.policy_old.critic(old_states).detach()
 
-        # Reshape values to (Time, N_Drivers) to match rewards
         n_steps = len(self.buffer.rewards)
         n_drivers = CONFIG['N_DRIVERS']
         values = values.view(n_steps, n_drivers)
@@ -382,43 +392,29 @@ class SharedPPOAgent:
         advantages = torch.zeros_like(rewards_tensor)
         last_gae_lam = 0
 
-        # GAE Loop
         for t in reversed(range(n_steps)):
             if t == n_steps - 1:
-                next_non_terminal = 0.0  # Last step assumes done
+                next_non_terminal = 0.0
                 next_values = 0
             else:
                 next_non_terminal = 1.0
                 next_values = values[t + 1]
-
             delta = rewards_tensor[t] + self.gamma * next_values * next_non_terminal - values[t]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
             advantages[t] = last_gae_lam
 
-        # Flatten for training
         advantages = advantages.view(-1)
         old_values = values.view(-1)
-
-        # Normalize
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
         returns = advantages + old_values
 
-        # Optimize policy for K epochs
         for _ in range(self.K_epochs):
-            # Evaluate old actions and values
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, old_masks)
-
             state_values = state_values.squeeze()
-
-            # Ratios
             ratios = torch.exp(logprobs - old_logprobs)
-
-            # Surrogate Loss
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
             loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, returns) - 0.01 * dist_entropy
-
             self.optimizer.zero_grad()
             loss.mean().backward()
             self.optimizer.step()
@@ -448,46 +444,26 @@ class SharedPPOAgent:
 class Trainer:
     def __init__(self, simulator_path='model/generators/simulator_hex_weekday.pkl', checkpoint_path='model/agent.pth'):
         self.checkpoint_path = checkpoint_path
-
-        # Initialize Environment (which loads simulator)
         self.env = RideHailingEnv(simulator_path)
-
-        # Initialize Agent
         self.agent = SharedPPOAgent(CONFIG['STATE_DIM'], CONFIG['ACTION_DIM'], **CONFIG)
 
     def train(self, platform_params, num_episodes=50):
         episode_rewards = []
-        print(f"\n--- Starting RL Training for {num_episodes} Episodes ---")
-
-        for episode in tqdm(range(num_episodes), desc="Training"):
+        for episode in tqdm(range(num_episodes)):
             state = self.env.reset()
             ep_reward = 0
-
-            # Loop for one day (144 steps)
             while True:
-                # 1. Get Action Mask (Valid moves)
                 mask = self.env.get_valid_actions_mask()
-
-                # 2. Agent Select Actions
                 actions = self.agent.select_actions(state, mask)
-
-                # 3. Environment Step
-                next_state, rewards, done, _ = self.env.step(actions, platform_params)
-
-                # 4. Store Buffer
+                next_state, rewards, done, info = self.env.step(actions, platform_params)
                 self.agent.buffer.rewards.append(rewards)
-                self.agent.buffer.is_terminals.append(done)  # Simplified scalar
-
+                self.agent.buffer.is_terminals.append(done)
                 state = next_state
                 ep_reward += np.sum(rewards)
-
-                if done:
-                    break
-
-            # Update Agent at end of episode
+                if done: break
             self.agent.update()
             episode_rewards.append(ep_reward)
-        # self._plot_rewards(episode_rewards)
+        self._plot_rewards(episode_rewards)
         return episode_rewards
 
     def visualize_simulation(self, platform_params, filename="img/hex_simulation.gif"):
@@ -502,33 +478,23 @@ class Trainer:
             mask = self.env.get_valid_actions_mask()
             actions = self.agent.select_actions(state, mask)
 
-            # Snapshot
             snapshot = {
                 'time': self.env.time,
                 'driver_locs': self.env.driver_locations.copy(),
                 'driver_status': self.env.driver_status.copy(),
-                # Convert pending orders indices back to coords for plotting?
-                # Ideally we need centroids.
-                # For simplicity, we just store indices.
             }
             states_snapshots.append(snapshot)
             state, _, done, _ = self.env.step(actions, platform_params)
 
-        # Get Centroids for plotting
-        # simulator.df contains explicit coords? No, Simulator has hex_ids.
-        # We need h3 to lat/lng.
-
-        # Precompute centroids for all zones
         centroids_dict = {}
         for idx, h_id in self.env.idx_to_hex.items():
             lat, lng = h3.cell_to_latlng(h_id)
-            centroids_dict[idx] = (lng, lat)  # x, y
+            centroids_dict[idx] = (lng, lat)
 
         def animate(i):
             ax.clear()
             snapshot = states_snapshots[i]
 
-            # Plot Drivers
             d_locs = snapshot['driver_locs']
             d_stats = snapshot['driver_status']
 
@@ -549,24 +515,23 @@ class Trainer:
         ani.save(filename, writer='pillow')
         print("Visualization saved.")
 
-    def _plot_rewards(self,rewards):
+    def _plot_rewards(self, rewards):
         plt.plot(rewards)
         plt.show()
 
 
 if __name__ == '__main__':
-    # 简单的测试入口
     platform_params = {
-        'commission': 0.2
+        'commission': 0.2,
+        'lambda': np.full((CONFIG['TIME_STEPS_PER_DAY'], 277), 2),
+        'subsidy': np.full((CONFIG['TIME_STEPS_PER_DAY'], 277), 2.5)
     }
 
-    # 确保有生成器文件
     sim_path = 'model/generators/simulator_hex_weekday.pkl'
     if not os.path.exists(sim_path):
         print(f"Error: Simulator file not found at {sim_path}")
         print("Please run generate_split_simulators.py first.")
     else:
         trainer = Trainer(simulator_path=sim_path)
-        rewards = trainer.train(platform_params, num_episodes=50)
+        rewards = trainer.train(platform_params, num_episodes=50)  # Reduced for test
         trainer.agent.save(trainer.checkpoint_path)
-        trainer.visualize_simulation(platform_params)
