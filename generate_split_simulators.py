@@ -15,8 +15,8 @@ from dataset.convert2polygon_bridge import HexGridProcessor, PassengerSimulator
 # --- 配置部分 ---
 CONFIG = {
     # 仿真环境参数 (用于计算缩放因子)
-    'N_DRIVERS': 60,  # 仿真环境中的司机数量
-    'TRIPS_PER_DRIVER_DAY': 100,  # 期望每个司机每天完成的订单数 (用于控制总单量)
+    'N_DRIVERS': 100,  # 仿真环境中的司机数量
+    'TRIPS_PER_DRIVER_DAY': 25,  # 期望每个司机每天完成的订单数 (用于控制总单量)
 
     # 数据与网格配置
     'SHAPEFILE_PATH': 'dataset/taxi_zones/taxi_zones.shp',  # 原始区域形状文件

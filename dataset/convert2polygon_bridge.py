@@ -17,6 +17,7 @@ class HexGridProcessor:
         self.shapefile_path = shapefile_path
         self.trip_data_path = trip_data_path
         self.hex_resolution = hex_resolution
+        self.avg_v = 0
         self.gdf_zones = None
         self.gdf_hex = None
         self.location_centroids = None
@@ -138,14 +139,25 @@ class HexGridProcessor:
         self.adjacency = {}
         valid_hexes = set(self.gdf_hex['hex_id'])
         for hex_id in valid_hexes:
-            neighbors = h3.grid_ring(hex_id, 1)
-            valid_neighbors = [n for n in neighbors if n in valid_hexes]
+
+            valid_neighbors = {}
+            edges = h3.origin_to_directed_edges(hex_id)
+            for direction_index, edge in enumerate(edges):
+                if edge == 0:
+                    continue  # 某些五边形边界情况可能没有6个邻居
+                # 2. 从单向边获取目标网格
+                neighbor_hex = h3.get_directed_edge_destination(edge)
+                if neighbor_hex in valid_hexes:
+                    valid_neighbors[direction_index] = neighbor_hex
             self.adjacency[hex_id] = valid_neighbors
 
     def _map_trips_to_hex(self):
         """将CSV行程映射到网格"""
         print("Mapping trip data...")
         df_trips = pd.read_parquet(self.trip_data_path)
+
+        self.avg_v=1.609344*df_trips['trip_miles'].sum()/df_trips['trip_time'].sum()  #0.007644803636864813km/s
+        self.avg_t=2.4/self.avg_v
 
         # 辅助函数：ID -> 经纬度
         def get_coords(loc_id):
@@ -184,14 +196,15 @@ class PassengerSimulator:
         self.df = df_gridded_trips
         self.adjacency = adjacency
         self.scaling_factor = scaling_factor
-        self.time_step = 10
+        self.time_step = 5
         self.demand_model = {}  # (time_step, hex) -> lambda
         self.transition_model = {}  # (time_step, origin) -> ([destinations], [probs])
         self.trip_props_model = {}  # (origin, dest) -> {dist, duration}
 
         self.df['pickup_datetime'] = pd.to_datetime(self.df['pickup_datetime'])
 
-        self.df['minute_step'] = (self.df['pickup_datetime'].dt.hour* 60 + self.df['pickup_datetime'].dt.minute)//self.time_step
+        self.df['pickup_minute_step'] = (self.df['pickup_datetime'].dt.hour* 60 + self.df['pickup_datetime'].dt.minute)//self.time_step
+        # self.df['duration_step']= np.ceil(self.df['trip_time']/(60*self.time_step))
         self._learn_distributions()
 
     def _estimate_ve(self):
@@ -202,23 +215,24 @@ class PassengerSimulator:
         num_days = self.df['pickup_datetime'].dt.date.nunique() or 1
 
         # 1. 需求分布 (泊松参数 lambda)
-        demand_counts = self.df.groupby(['minute_step', 'pickup_hex_id']).size() / num_days
+        demand_counts = self.df.groupby(['pickup_minute_step', 'pickup_hex_id']).size() / num_days
         self.demand_model = demand_counts.to_dict()
 
         # 2. 转移概率 (Origin -> Destination)
-        transitions = self.df.groupby(['minute_step', 'pickup_hex_id', 'dropoff_hex_id']).size().reset_index(name='count')
-        for (minute_step, origin), group in transitions.groupby(['minute_step', 'pickup_hex_id']):
+        transitions = self.df.groupby(['pickup_minute_step', 'pickup_hex_id', 'dropoff_hex_id']).size().reset_index(name='count')
+        for (pickup_minute_step, origin), group in transitions.groupby(['pickup_minute_step', 'pickup_hex_id']):
             total = group['count'].sum()
-            self.transition_model[(minute_step, origin)] = (
+            self.transition_model[(pickup_minute_step, origin)] = (
                 group['dropoff_hex_id'].values,
                 group['count'].values / total
             )
 
         # 3. 行程属性 (距离和时间)
-        dist_col = 'trip_miles'
-        dur_col = 'trip_time'
         self.trip_props_model = self.df.groupby(['pickup_hex_id', 'dropoff_hex_id'])[
-            [dist_col, dur_col]].mean().to_dict('index')
+            ['trip_miles', 'trip_time']].mean().to_dict('index')
+
+        for (origin, dest), props in self.trip_props_model.items():
+            props['duration_step'] = np.ceil(props['trip_time']/(60 * self.time_step))
 
 
     def generate_orders(self, time_slot, all_hex_ids):
@@ -238,10 +252,10 @@ class PassengerSimulator:
             dests = np.random.choice(trans_data[0], size=num_requests, p=trans_data[1])
 
             for dest_hex in dests:
-                props = self.trip_props_model.get((hex_id, dest_hex), {'trip_distance': 1.0, 'trip_duration': 5})
+                props = self.trip_props_model.get((hex_id, dest_hex), {'duration_step': 1.0, 'trip_miles': 5})
                 # 兼容不同的列名
-                dist = props.get('trip_miles', 1)
-                dur = props.get('trip_time', 10)//self.time_step
+                dur = props.get('duration_step', 1)
+                dist = props.get('trip_miles', 5)
 
                 all_orders.append({
                     'origin_hex': hex_id,
