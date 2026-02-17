@@ -207,9 +207,6 @@ class PassengerSimulator:
         # self.df['duration_step']= np.ceil(self.df['trip_time']/(60*self.time_step))
         self._learn_distributions()
 
-    def _estimate_ve(self):
-        pass
-
     def _learn_distributions(self):
         print("Learning demand distributions...")
         num_days = self.df['pickup_datetime'].dt.date.nunique() or 1
@@ -265,10 +262,22 @@ class PassengerSimulator:
                 })
         return all_orders
 
-    def real_orders(self):
-        """统计真实数据的订单空间分布"""
-        return self.df['pickup_hex_id'].value_counts().to_dict()
 
+class FixedPassengerSimulator(PassengerSimulator):
+    def __init__(self, df_gridded_trips, adjacency, scaling_factor=1.0):
+        super().__init__(df_gridded_trips, adjacency, scaling_factor)
+        self.fixed_orders = self.real_orders()
+
+    def generate_orders(self, time_slot, all_hex_ids):
+        all_orders = []
+        for hex_id in all_hex_ids:
+            num_requests = self.fixed_orders.get(hex_id, 0)
+            if num_requests == 0: continue
+
+            trans_data = self.transition_model.get((time_slot, hex_id))
+            if not trans_data: continue
+
+            dests = np.random.choice(trans_data[0], size=num_requests, p=trans_data[1])
 
 if __name__ == '__main__':
     # 示例配置

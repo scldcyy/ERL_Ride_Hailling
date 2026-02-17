@@ -15,7 +15,7 @@ class DataSetProcesser:
         self.df_trips = None
         self.valid_gdf_zones= None
         cur_dir = os.path.dirname(os.path.abspath(__file__))
-        self.trip_data_file = os.path.join(cur_dir,'fhvhv_jan_01.parquet')
+        self.trip_data_file = os.path.join(cur_dir,'fhvhv_tripdata_2024-01.parquet')
         self.zone_lookup_file = os.path.join(cur_dir,'taxi+_zone_lookup.csv')
         self.shapefile_dir = os.path.join(cur_dir,'taxi_zones')
         self.shapefile_path = os.path.join(self.shapefile_dir, 'taxi_zones.shp')
@@ -122,7 +122,7 @@ class DataSetProcesser:
         print("Geographic clustering complete.")
 
     # 绘制直方图，统计时间段
-    def timePeriodStat(self, save_path='stat/time_period_stat.png'):
+    def timePeriodStat(self, save_path='stat/time_period_stat111.png'):
         print("--- Task 1: Analyzing Order Volume by Hour ---")
         plt.figure(figsize=(12, 7))
         sns.barplot(x=self.hourly_counts.index, y=self.hourly_counts.values, palette="viridis")
@@ -162,9 +162,7 @@ if __name__ == '__main__':
     # DataSetProcesser.cutDataSet()
 
     # # --绘制统计图--#
-    # dataSetProcesser = DataSetProcesser()
-    # dataSetProcesser.timePeriodStat()
-    # dataSetProcesser.zoneLookup()
-    # dataSetProcesser.subRegionStat()
+    dataSetProcesser = DataSetProcesser()
+    dataSetProcesser.timePeriodStat()
     pass
 
