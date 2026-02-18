@@ -10,7 +10,7 @@ import sys
 sys.path.append('dataset')
 
 # 导入您指定的 convert2polygon_bridge 中的类
-from dataset.convert2polygon_bridge import HexGridProcessor, PassengerSimulator
+from dataset.generate_simulator import HexGridProcessor, PassengerSimulator
 
 # --- 配置部分 ---
 CONFIG = {
