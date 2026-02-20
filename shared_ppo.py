@@ -1,251 +1,17 @@
+import sys
 import os
-
 import h3
 import numpy as np
 import torch
 import torch.nn as nn
-from matplotlib import pyplot as plt, animation
+from matplotlib import pyplot as plt
 from torch.distributions import Categorical
 from torch.utils.data import BatchSampler, SubsetRandomSampler
-import pickle
-import sys
-import copy
-
 from tqdm import tqdm
+from basic_config import CONFIG
+from ride_hailing_env import RideHailingEnv
 
 sys.path.append(os.getcwd())
-
-# --- Global Config ---
-CONFIG = {
-    'N_DRIVERS': 200,
-    'TIME_STEP_MINUTES': 5,
-    'TIME_STEPS_PER_DAY': 288,
-    'N_ZONES':277,
-
-    # PPO Hyperparameters
-    'HIDDEN_DIM': 256,
-    'STATE_DIM': 9,  # [Lat, Lng, Orders, Drivers, AvgOrders, AvgDrivers, FreeTime, Surge, Subsidy]
-    'ACTION_DIM': 8,
-    'LR_ACTOR': 3e-4,
-    'LR_CRITIC': 1e-3,
-    'GAMMA': 0.99,
-    'GAE_LAMBDA': 0.95,
-    'PPO_EPOCHS': 10,
-    'BATCH_SIZE': 512,
-    'EPS_CLIP': 0.2,
-    'ENTROPY_COEF': 0.01,
-    'MAX_GRAD_NORM': 0.5,
-
-    # Economics
-    'BASE_FARE': 2.5,
-    'PRICE_PER_MINUTE': 0.5,
-    'OPPORTUNITY_COST_PER_STEP': 0.1,
-    'REPOSITION_COST_PER_STEP': 0.2,
-    'IDLE_REWARD': -0.05,
-    'MIN_FARE_THRESHOLD': 4.0
-}
-
-
-class RideHailingEnv:
-    def __init__(self, simulator_path, fixed_scenarios=None):
-        with open(simulator_path, 'rb') as f:
-            self.simulator = pickle.load(f)
-
-        self.all_hexes = list(self.simulator.adjacency.keys())
-        self.n_zones = len(self.all_hexes)
-        self.hex_to_idx = {h: i for i, h in enumerate(self.all_hexes)}
-        self.idx_to_hex = {i: h for i, h in enumerate(self.all_hexes)}
-
-        self.adjacency_indices = {}
-        for h_id, neighbors in self.simulator.adjacency.items():
-            idx = self.hex_to_idx[h_id]
-            n_indices = {direct: self.hex_to_idx[n_h_id] for direct, n_h_id in neighbors.items()}
-            self.adjacency_indices[idx] = n_indices
-
-        self.fixed_scenarios = fixed_scenarios
-        self.current_scenario_idx = 0
-
-        self.total_revenue = 0
-        self.total_served_orders = 0
-        self.total_generated_orders = 0
-        self.total_wait_time = 0
-        self.pending_orders = []
-
-    def reset(self):
-        self.time = 0
-        # 固定种子以保证每个Scenario内的初始位置一致
-        rng = np.random.RandomState(42 + self.current_scenario_idx)
-        self.driver_locations = rng.randint(0, self.n_zones, size=CONFIG['N_DRIVERS'])
-        self.driver_status = np.zeros(CONFIG['N_DRIVERS'], dtype=int)
-        self.driver_free_time = np.zeros(CONFIG['N_DRIVERS'], dtype=int)
-
-        self.total_revenue = 0
-        self.total_served_orders = 0
-        self.total_generated_orders = 0
-        self.total_wait_time = 0
-        self.pending_orders = []
-
-        if self.fixed_scenarios is not None:
-            self.current_day_orders = self.fixed_scenarios[self.current_scenario_idx % len(self.fixed_scenarios)]
-            self.current_scenario_idx += 1
-
-        return self._get_state(platform_params=None)
-
-    def _get_state(self, platform_params=None):
-        order_counts = np.zeros(self.n_zones)
-        for o in self.pending_orders:
-            if not o['matched']:
-                order_counts[o['origin_idx']] += 1
-
-        idle_mask = (self.driver_status == 0)
-        idle_driver_counts = np.bincount(self.driver_locations[idle_mask], minlength=self.n_zones)
-
-        if platform_params is None:
-            current_surges = np.ones(self.n_zones)
-            current_subsidies = np.zeros(self.n_zones)
-        else:
-            t = min(self.time, CONFIG['TIME_STEPS_PER_DAY'] - 1)
-            current_surges = platform_params['lambda'][t]
-            current_subsidies = platform_params['subsidy'][t]
-
-        states = np.zeros((CONFIG['N_DRIVERS'], CONFIG['STATE_DIM']))
-
-        for i in range(CONFIG['N_DRIVERS']):
-            loc = self.driver_locations[i]
-            neighbors = self.adjacency_indices.get(loc, {})
-            if neighbors:
-                n_locs = list(neighbors.values())
-                avg_n_orders = order_counts[n_locs].mean()
-                avg_n_drivers = idle_driver_counts[n_locs].mean()
-            else:
-                avg_n_orders = 0
-                avg_n_drivers = 0
-
-            states[i] = [
-                loc / self.n_zones,
-                self.time / CONFIG['TIME_STEPS_PER_DAY'],
-                order_counts[loc],
-                idle_driver_counts[loc],
-                avg_n_orders,
-                avg_n_drivers,
-                1.0 if self.driver_free_time[i] > 0 else 0.0,
-                current_surges[loc],
-                current_subsidies[loc]
-            ]
-        return states
-
-    def get_global_observation(self):
-        order_counts = np.zeros(self.n_zones)
-        for o in self.pending_orders:
-            if not o['matched']: order_counts[o['origin_idx']] += 1
-
-        idle_mask = (self.driver_status == 0)
-        driver_counts = np.bincount(self.driver_locations[idle_mask], minlength=self.n_zones)
-
-        # 简单归一化
-        obs = np.stack([
-            order_counts / (order_counts.max() + 1e-6),
-            driver_counts / (driver_counts.max() + 1e-6),
-        ])
-        return obs
-
-    def step(self, actions, platform_params):
-        prev_revenue = self.total_revenue
-
-        self.driver_free_time[self.driver_free_time > 0] -= 1
-        freed_drivers = np.where((self.driver_status == 1) & (self.driver_free_time == 0))[0]
-        self.driver_status[freed_drivers] = 0
-
-        if self.fixed_scenarios is not None:
-            raw_orders = copy.deepcopy(self.current_day_orders[self.time])
-        else:
-            raw_orders = self.simulator.generate_orders(self.time, self.all_hexes)
-
-        self.total_generated_orders += len(raw_orders)
-
-        new_orders = []
-        for o in raw_orders:
-            if o['origin_hex'] in self.hex_to_idx and o['dest_hex'] in self.hex_to_idx:
-                o['origin_idx'] = self.hex_to_idx[o['origin_hex']]
-                o['dest_idx'] = self.hex_to_idx[o['dest_hex']]
-                o['matched'] = False
-                o['wait_time'] = 0
-                new_orders.append(o)
-
-        self.pending_orders = [o for o in self.pending_orders if not o['matched'] and o['wait_time'] < 3]
-        for o in self.pending_orders:
-            o['wait_time'] += 1
-            self.total_wait_time += 1
-
-        self.pending_orders.extend(new_orders)
-        rewards = np.zeros(CONFIG['N_DRIVERS'])
-        step_subsidy_cost = 0.0
-
-        idle_indices = np.where(self.driver_status == 0)[0]
-        # 在 Scenarios 模式下，这里的 shuffle 应该由全局种子控制，但为保持多样性保留 random
-        np.random.shuffle(idle_indices)
-
-        for i in idle_indices:
-            action = actions[i]
-            current_loc = self.driver_locations[i]
-
-            if action == 0:  # Serve
-                local_orders = [o for o in self.pending_orders if o['origin_idx'] == current_loc and not o['matched']]
-                if local_orders:
-                    order = local_orders[0]
-                    order['matched'] = True
-                    self.total_served_orders += 1
-                    trip_steps = max(1, int(order['duration']))
-
-                    surge = platform_params['lambda'][self.time, current_loc]
-                    comm_rate = platform_params['commission']
-                    explicit_subsidy = platform_params['subsidy'][self.time, current_loc]
-
-                    base_fare = (CONFIG['BASE_FARE'] + trip_steps * CONFIG['TIME_STEP_MINUTES'] * CONFIG[
-                        'PRICE_PER_MINUTE'])
-                    gross_fare = base_fare * surge
-                    driver_nominal_income = gross_fare * (1 - comm_rate) + explicit_subsidy
-
-                    actual_driver_income = max(driver_nominal_income, CONFIG['MIN_FARE_THRESHOLD'])
-                    gap_subsidy = actual_driver_income - driver_nominal_income
-                    step_subsidy_cost += (gap_subsidy + explicit_subsidy)
-
-                    op_cost = trip_steps * CONFIG['OPPORTUNITY_COST_PER_STEP']
-                    rewards[i] = actual_driver_income - op_cost
-                    self.driver_status[i] = 1
-                    self.driver_free_time[i] = trip_steps
-                    self.driver_locations[i] = order['dest_idx']
-                    self.total_revenue += gross_fare
-                else:
-                    rewards[i] = CONFIG['IDLE_REWARD']
-            else:  # Reposition
-                target_direct = action - 2
-                neighbors = self.adjacency_indices.get(current_loc, {})
-                if target_direct in neighbors:
-                    rewards[i] = -CONFIG['REPOSITION_COST_PER_STEP']
-                    self.driver_status[i] = 1
-                    self.driver_free_time[i] = 1
-                    self.driver_locations[i] = neighbors[target_direct]
-                else:
-                    rewards[i] = 0
-
-        step_revenue = self.total_revenue - prev_revenue
-        step_profit = step_revenue * platform_params['commission'] - step_subsidy_cost
-
-        self.time += 1
-        done = (self.time >= CONFIG['TIME_STEPS_PER_DAY'])
-        next_state = self._get_state(platform_params)
-
-        info = {
-            'step_profit': step_profit,
-            'total_revenue': self.total_revenue,
-            'total_served': self.total_served_orders,
-            'total_generated': self.total_generated_orders,
-            'total_wait_time': self.total_wait_time,
-        }
-
-        return next_state, rewards, done, info
-
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
@@ -429,9 +195,10 @@ class Trainer:
                     ep_wait_times.append(wait_time)
                     break
             self.agent.update()
-        # self._plot_rewards(ep_profits)
-        # self._plot_rewards(ep_completion_rates)
-        # self._plot_rewards(ep_wait_times)
+
+        self._plot_rewards(ep_profits)
+        self._plot_rewards(ep_completion_rates)
+        self._plot_rewards(ep_wait_times)
 
         return np.array([np.mean(ep_profits), np.mean(ep_completion_rates), np.mean(ep_wait_times)])
 
@@ -460,9 +227,8 @@ class Trainer:
 
 if __name__ == '__main__':
     platform_params = {
-        'commission': 0.2,
-        'lambda': np.full((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']), 2),
-        'subsidy': np.full((CONFIG['TIME_STEPS_PER_DAY'], CONFIG['N_ZONES']), 2.5)
+        'surge': lambda t,no,nd,sd:1+0.5*np.log(sd),
+        'subsidy': lambda t,no,nd,sd:1+0.5*np.log(no/nd)*np.sin(t)
     }
 
     sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
