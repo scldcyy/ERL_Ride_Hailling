@@ -291,7 +291,7 @@ class SAMO_GP_Solver:
         return pop, logbook
 
     def save_results(self, population, logbook, filename_prefix="samo_gp_final"):
-        os.makedirs("experiment_results", exist_ok=True)
+        os.makedirs("../experiment_results", exist_ok=True)
 
         # 提取 Pareto 前沿
         pareto_front = tools.sortNondominated(population, len(population), first_front_only=True)[0]
@@ -302,7 +302,7 @@ class SAMO_GP_Solver:
             'archive': self.archive  # 所有历史数据
         }
 
-        path = os.path.join("experiment_results", f"{filename_prefix}.pkl")
+        path = os.path.join("../experiment_results", f"{filename_prefix}.pkl")
         with open(path, 'wb') as f:
             pickle.dump(data, f)
         print(f"Results saved to {path}")
@@ -336,7 +336,7 @@ if __name__ == "__main__":
     SIM_PATH = "dummy_simulator12.pkl"
     if not os.path.exists(SIM_PATH):
         # 尝试找真实路径
-        real_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
+        real_path = '../model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
         if os.path.exists(real_path):
             SIM_PATH = real_path
         else:

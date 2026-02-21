@@ -9,8 +9,8 @@ import sys
 # 假设当前脚本位于项目根目录，dataset 文件夹在同级
 sys.path.append('dataset')
 
-# 导入您指定的 convert2polygon_bridge 中的类
-from dataset.generate_simulator import HexGridProcessor, PassengerSimulator
+# 导入您指定的 convert2polygon_bridge.py 中的类
+from dataset.convert2polygon_bridge import HexGridProcessor, PassengerSimulator
 
 # --- 配置部分 ---
 CONFIG = {
@@ -51,7 +51,7 @@ def main():
     df_all_trips, gdf_hex = processor.process()
 
     # 此时 df_all_trips 应该包含 CSV 中的所有列，包括时间
-    # 确保时间列是 datetime 类型 (convert2polygon_bridge 中可能还没转)
+    # 确保时间列是 datetime 类型 (convert2polygon_bridge.py 中可能还没转)
     time_col = 'pickup_datetime'
     if df_all_trips[time_col].dtype == 'object':
         df_all_trips[time_col] = pd.to_datetime(df_all_trips[time_col])
@@ -93,7 +93,7 @@ def main():
         scaling_factor = sim_capacity / real_daily_avg
         print(f"  - 计算缩放因子: {scaling_factor:.4f}")
 
-        # 实例化 PassengerSimulator (使用 convert2polygon_bridge 中的类)
+        # 实例化 PassengerSimulator (使用 convert2polygon_bridge.py 中的类)
         # 注意：这里传入的是 processor.adjacency，这是该类特有的参数
         sim = PassengerSimulator(
             df_gridded_trips=sub_df,

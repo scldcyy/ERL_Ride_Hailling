@@ -1,7 +1,5 @@
 import numpy as np
 import pickle
-import copy
-from collections import defaultdict
 
 # --- 全局配置参数 (增强版) ---
 CONFIG = {
@@ -16,7 +14,7 @@ CONFIG = {
     'OPPORTUNITY_COST': 0.5,  # [新增] 司机每一步的空闲/机会成本
 
     # 乘客参数 [新增]
-    'MAX_WAIT_TIME': 6,  # 最大等待步数 (6 * 5min = 30min)
+    'MAX_WAIT_TIME': 6,  # 最大等待步数 (6 * 5min = 20min)
     'BASE_CANCEL_PROB': 0.05,  # 每一步的基础取消概率
 
     # 经济参数

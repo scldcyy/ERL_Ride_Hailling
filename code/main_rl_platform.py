@@ -3,7 +3,8 @@ import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
 from tqdm import tqdm
-from shared_ppo import CONFIG, Trainer
+from basic_config import CONFIG
+from shared_ppo import Trainer
 
 
 class PlatformActorCritic(nn.Module):

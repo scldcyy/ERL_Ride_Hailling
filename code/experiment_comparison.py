@@ -6,14 +6,14 @@ import numpy as np
 from tqdm import tqdm
 
 # 引入各个模块
-from main_rbf_temporal import RBF_Solver, SpatiotemporalStrategyEncoder, get_normalized_coords
+from code.main_rbf_temporal import SpatiotemporalStrategyEncoder, get_normalized_coords
 from main_gp import GP_Solver, pset  # 需要引入 pset 用于编译 GP 树
 from main_rl_platform import RL_Solver, PlatformActorCritic
 from shared_ppo import CONFIG, RideHailingEnv, SharedPPOAgent
 from deap import gp
 
-SIM_PATH = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
-RESULTS_DIR = 'experiment_results'
+SIM_PATH = '../model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
+RESULTS_DIR = '../experiment_results'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 

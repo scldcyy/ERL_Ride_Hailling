@@ -10,13 +10,13 @@ import sys
 
 # 引入项目模块
 sys.path.append(os.getcwd())
-from main_ea import ERL_Solver_Spatial, SpatialStrategyEncoder, get_normalized_coords
+from code.main_ea import ERL_Solver_Spatial, SpatialStrategyEncoder, get_normalized_coords
 from shared_ppo import CONFIG, Trainer, RideHailingEnv
 
 # 设置绘图风格
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_context("paper", font_scale=1.5)
-RESULTS_DIR = 'paper_experiments'
+RESULTS_DIR = '../paper_experiments'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -427,7 +427,7 @@ class ExperimentRunner:
 
 if __name__ == '__main__':
     # 请修改此处为实际的模拟器路径
-    sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
+    sim_path = '../model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
 
     if os.path.exists(sim_path):
         runner = ExperimentRunner(sim_path)

@@ -2,11 +2,11 @@ CONFIG = {
     'N_DRIVERS': 400,
     'TIME_STEP_MINUTES': 5,
     'TIME_STEPS_PER_DAY': 288,
-    'N_ZONES':277,
+    'N_ZONES': 277,
 
     # PPO Hyperparameters
     'HIDDEN_DIM': 256,
-    'STATE_DIM': 10,  # [Lat, Lng,t, Orders, Drivers, AvgOrders, AvgDrivers, FreeTime, Surge, Subsidy]
+    'STATE_DIM': 12,  # [Lat, Lng, t, Orders, Drivers, AvgOrders, AvgDrivers, FreeTime, Surge, Subsidy, DriverType, IncomeProgress]
     'ACTION_DIM': 8,
     'LR_ACTOR': 3e-4,
     'LR_CRITIC': 1e-3,
@@ -24,7 +24,11 @@ CONFIG = {
     'OPPORTUNITY_COST_PER_STEP': 0.1,
     'REPOSITION_COST_PER_STEP': 0.2,
     'IDLE_REWARD': -0.05,
-    'MIN_FARE_THRESHOLD': 4.0
+    'MIN_FARE_THRESHOLD': 4.0,
+    'MIN_SURGE':1.0,
+    'MAX_SURGE': 5.0,
+    'MIN_SUBSIDY': 0.0,
+    'MAX_SUBSIDY': 20.0,
 }
 
 # --- 新增：司机异质性配置 --

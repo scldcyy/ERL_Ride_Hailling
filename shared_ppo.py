@@ -1,6 +1,6 @@
+import copy
 import sys
 import os
-import h3
 import numpy as np
 import torch
 import torch.nn as nn
@@ -166,15 +166,45 @@ class SharedPPOAgent:
         self.policy_old.load_state_dict(weights[1])
 
 
+def calculate_gini(incomes):
+    """计算司机收入的基尼系数 (Gini Index)"""
+    if len(incomes) == 0:
+        return 0.0
+    # 确保没有负收入导致计算错误
+    incomes = np.clip(np.sort(incomes), a_min=0, a_max=None)
+    n = len(incomes)
+    index = np.arange(1, n + 1)
+
+    total_income = np.sum(incomes)
+    if total_income == 0:
+        return 0.0
+
+    # Gini formula
+    gini = (2 * np.sum(index * incomes)) / (n * total_income) - (n + 1) / n
+    return float(gini)
+
 class Trainer:
     def __init__(self, simulator_path, fixed_scenarios=None):
         self.env = RideHailingEnv(simulator_path, fixed_scenarios=fixed_scenarios)
         self.agent = SharedPPOAgent(CONFIG['STATE_DIM'], CONFIG['ACTION_DIM'], **CONFIG)
+        self.save_base_weights()
+
+    def save_base_weights(self):
+        """深拷贝保存 PPO 代理的初始状态字典"""
+        self.base_policy_state = copy.deepcopy(self.agent.policy.state_dict())
+        self.base_policy_old_state = copy.deepcopy(self.agent.policy_old.state_dict())
+
+    def reset_to_base_weights(self):
+        """重置底层 PPO 代理的权重，并清空经验池，避免历史污染"""
+        self.agent.policy.load_state_dict(self.base_policy_state)
+        self.agent.policy_old.load_state_dict(self.base_policy_old_state)
+        self.agent.buffer.clear()
 
     def train_and_evaluate(self, platform_params, num_episodes=5):
         ep_profits = []
-        ep_completion_rates = []
+        # ep_completion_rates = []
         ep_wait_times = []
+        ep_ginis = []  # --- 新增：记录基尼系数 ---
 
         for _ in tqdm(range(num_episodes)):
             state = self.env.reset()
@@ -187,20 +217,26 @@ class Trainer:
                 ep_total_profit += info['step_profit']
                 state = next_state
                 if done:
-                    total_demand = info['total_generated'] + 1e-6
-                    completion_rate = info['total_served'] / total_demand
+                    # total_demand = info['total_generated'] + 1e-6
+                    # completion_rate = info['total_served'] / total_demand
                     wait_time = -info['total_wait_time']
+                    # --- 新增：计算并记录基尼系数 ---
+                    gini_index = calculate_gini(info['driver_income'])
                     ep_profits.append(ep_total_profit)
-                    ep_completion_rates.append(completion_rate)
+                    # ep_completion_rates.append(completion_rate)
                     ep_wait_times.append(wait_time)
+                    ep_ginis.append(-gini_index)  # 取负值以适应最大化求解器
                     break
             self.agent.update()
 
-        self._plot_rewards(ep_profits)
-        self._plot_rewards(ep_completion_rates)
-        self._plot_rewards(ep_wait_times)
+        # self._plot_rewards(ep_profits)
+        # self._plot_rewards(ep_wait_times)
 
-        return np.array([np.mean(ep_profits), np.mean(ep_completion_rates), np.mean(ep_wait_times)])
+        return np.array([
+            np.mean(ep_profits),
+            np.mean(ep_wait_times),
+            np.mean(ep_ginis)
+        ])
 
     def train(self, platform_params, num_episodes=50):
         episode_rewards = []
@@ -227,8 +263,10 @@ class Trainer:
 
 if __name__ == '__main__':
     platform_params = {
-        'surge': lambda t,no,nd,sd:1+0.5*np.log(sd),
-        'subsidy': lambda t,no,nd,sd:1+0.5*np.log(no/nd)*np.sin(t)
+        # Add 1e-6 to avoid log(0)
+        'surge': lambda t, no, nd, sd: 1 + 0.5 * np.log(sd + 1e-6),
+        # Use sd directly instead of no/nd, and add 1e-6
+        'subsidy': lambda t, no, nd, sd: 1 + 0.5 * np.log(sd + 1e-6) * np.sin(t)
     }
 
     sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'

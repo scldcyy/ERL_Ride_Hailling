@@ -366,7 +366,7 @@ class ERL_Solver_Spatial:
 
 if __name__ == '__main__':
     # 路径需根据实际情况修改
-    sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
+    sim_path = '../model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
     if os.path.exists(sim_path):
         solver = ERL_Solver_Spatial(simulator_path=sim_path, max_gens=30, pop_size=20)
         solver.solve()

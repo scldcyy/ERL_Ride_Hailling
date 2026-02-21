@@ -101,29 +101,52 @@ class RideHailingEnv:
                 avg_n_orders = 0
                 avg_n_drivers = 0
 
-            # 严格按照文档定义的10维状态填充
+                # --- 新增：计算收入完成度 ---
+                # 用兼职司机的目标收入作为统一的归一化基准
+            income_progress = self.driver_daily_income[i] / DRIVER_CONFIG['PART_TIME_INCOME_TARGET']
+
+            # 扩展为12维状态填充
             states[i] = [
-                lat / 90.0,  # 纬度归一化到[0,1]
-                lng / 180.0,  # 经度归一化到[0,1] #时间系数
+                lat / 90.0,
+                lng / 180.0,
                 self.time / CONFIG['TIME_STEPS_PER_DAY'],
-                order_counts[loc_idx],  # 当前区域订单数
-                idle_driver_counts[loc_idx],  # 当前区域司机数
-                avg_n_orders,  # 邻居平均订单数
-                avg_n_drivers,  # 邻居平均司机数
-                self.driver_free_time[i] / CONFIG['TIME_STEPS_PER_DAY'],  # 空驶时间归一化
-                surge[loc_idx],  # 溢价系数λ
-                subsidy[loc_idx]  # 补贴
+                order_counts[loc_idx],
+                idle_driver_counts[loc_idx],
+                avg_n_orders,
+                avg_n_drivers,
+                self.driver_free_time[i] / CONFIG['TIME_STEPS_PER_DAY'],
+                surge[loc_idx],
+                subsidy[loc_idx],
+                float(self.driver_type[i]),  # 10. 司机类型: 0=兼职, 1=全职
+                income_progress  # 11. 收入进度
             ]
         return states
 
-    def compile(self,platform_params):
-        order_counts,idle_driver_counts=self.get_global_observation()
+    def compile(self, platform_params):
+        order_counts, idle_driver_counts = self.get_global_observation()
         surge_function = platform_params['surge']
         subsidy_function = platform_params['subsidy']
-        surge=surge_function(self.time/CONFIG['TIME_STEPS_PER_DAY'], order_counts, idle_driver_counts, order_counts/(idle_driver_counts+1e-6))
-        subsidy = subsidy_function(self.time/CONFIG['TIME_STEPS_PER_DAY'], order_counts, idle_driver_counts, order_counts/(idle_driver_counts+1e-6))
+        min_surge=CONFIG['MIN_SURGE']
+        max_surge=CONFIG['MAX_SURGE']
+        min_subsidy=CONFIG['MIN_SUBSIDY']
+        max_subsidy=CONFIG['MAX_SUBSIDY']
 
-        return surge,subsidy
+        # Calculate supply-demand ratio safely
+        sd = order_counts / (idle_driver_counts + 1e-6)
+
+        surge = surge_function(self.time / CONFIG['TIME_STEPS_PER_DAY'], order_counts, idle_driver_counts, sd)
+        subsidy = subsidy_function(self.time / CONFIG['TIME_STEPS_PER_DAY'], order_counts, idle_driver_counts, sd)
+
+        # --- 新增：为 GP 算法添加安全网 ---
+        # 1. 处理由非法公式产生的 nan 或 inf
+        surge = np.nan_to_num(surge, nan=min_surge, posinf=max_surge, neginf=min_surge)
+        subsidy = np.nan_to_num(subsidy, nan=min_subsidy, posinf=max_subsidy, neginf=min_subsidy)
+
+        # 2. 截断极值，防止溢价和补贴过大导致环境崩溃
+        surge = np.clip(surge, min_surge, max_surge)  # 溢价至少为1，最高限制为5倍
+        subsidy = np.clip(subsidy, min_subsidy, max_subsidy)  # 补贴不能为负，设置一个合理上限
+
+        return surge, subsidy
 
 
     def get_global_observation(self):
@@ -147,6 +170,7 @@ class RideHailingEnv:
         commission=DRIVER_CONFIG['PLATFORM_COMMISSION_RATIO']
 
         step_revenue = 0
+        zone_profits = np.zeros(self.n_zones)  # --- 新增 1：初始化网格局部利润矩阵 ---
 
         # --- 1. 处理司机上下线逻辑 ---
         self._update_driver_online_status(surge,subsidy)
@@ -216,6 +240,11 @@ class RideHailingEnv:
                     gap_subsidy = actual_income - driver_income
                     step_subsidy_cost += (gap_subsidy + current_subsidy)
 
+                    # --- 新增 2：计算并记录该网格的局部利润 ---
+                    local_profit = price * commission - (gap_subsidy + current_subsidy)
+                    zone_profits[current_loc] += local_profit
+                    # ------------------------------------------
+
                     # 更新司机状态
                     rewards[i] = actual_income
                     self.driver_status[i] = 1
@@ -249,6 +278,7 @@ class RideHailingEnv:
 
         info = {
             'step_profit': step_profit,
+            'zone_profits': zone_profits,  # <--- 暴露局部利润
             'total_revenue': self.total_revenue,
             'total_served': self.total_served_orders,
             'total_generated': self.total_generated_orders,
