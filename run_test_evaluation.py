@@ -111,4 +111,6 @@ def run_fair_benchmark(sim_path, save_dir="results"):
 
 if __name__ == "__main__":
     sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
-    run_fair_benchmark(sim_path)
+    test_results=pickle.load(open('results/test_pareto_fronts.pkl', 'rb'))
+    pass
+    # run_fair_benchmark(sim_path)
