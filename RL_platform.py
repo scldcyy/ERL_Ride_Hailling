@@ -82,7 +82,7 @@ class PlatformPPOAgent:
 
         # === 核心修复 1：空间信用分配 (按区域独立计算折扣回报) ===
         discounted_rewards = []
-        discounted_reward = np.zeros(self.states[0].shape[0]) # 形状为 (N_ZONES,)
+        discounted_reward = np.zeros(self.states[0].shape[0])  # 形状为 (N_ZONES,)
 
         for reward_array in reversed(self.rewards):
             discounted_reward = reward_array + 0.99 * discounted_reward
@@ -90,17 +90,27 @@ class PlatformPPOAgent:
 
         # 将 (T, N_ZONES) 拉平为 T * N_ZONES 维度
         rewards_tensor = torch.tensor(np.array(discounted_rewards), dtype=torch.float32).view(-1)
+
+        # --- FIX: Calculate and normalize advantages ONCE outside the loop ---
+        with torch.no_grad():
+            old_state_values = self.policy_old.critic(old_states).squeeze()
+            advantages = rewards_tensor - old_state_values
+
+        # 标准化 Advantage 和 Return 以稳定训练
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
         rewards_tensor = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-7)
 
         for _ in range(10):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
-            advantages = rewards_tensor - state_values.detach()
+
+            # 注意: 这里不再重新计算 Advantage!
 
             ratios = torch.exp(logprobs - old_logprobs)
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - 0.2, 1 + 0.2) * advantages
 
-            loss = -torch.min(surr1, surr2).mean() + 0.5 * nn.MSELoss()(state_values, rewards_tensor) - 0.01 * dist_entropy.mean()
+            loss = -torch.min(surr1, surr2).mean() + 0.5 * nn.MSELoss()(state_values,
+                                                                        rewards_tensor) - 0.01 * dist_entropy.mean()
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -132,7 +142,7 @@ class RLPlatformPolicy:
         if t != self.last_t:
             n_zones = len(no)
             t_array = np.full(n_zones, t)
-            states = np.stack([t_array, no, nd, sd], axis=-1)
+            states = np.stack([t_array, no/50.0, nd/50.0, sd], axis=-1)
 
             self.current_surge, self.current_subsidy = self.agent.select_actions(states)
             self.last_t = t

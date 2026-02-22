@@ -202,7 +202,7 @@ def plot_and_save_results(hof, history, save_dir="results"):
     print(f"\nDE Baseline results saved to {save_dir}/samode_results.pkl")
     print("\nSample Best Formulas found by SAMO-GP:")
     for i in range(min(3, len(hof))):
-        print(f"[{i + 1}] Surge: {hof[i][0]} | Subsidy: {hof[i][1]}")
+        print(f"[{i + 1}] Surge & Subsidy: {hof[i]}")
 
 
 if __name__ == '__main__':

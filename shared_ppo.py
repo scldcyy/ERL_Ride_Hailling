@@ -101,6 +101,9 @@ class SharedPPOAgent:
 
         T, N, _ = old_states.shape
 
+        # If the sum of absolute values in a state is > 0, the driver is online.
+        active_masks = (torch.abs(old_states).sum(dim=2) > 1e-6).float()
+
         with torch.no_grad():
             flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
             values = self.policy_old.critic(flat_states).view(T, N)
@@ -115,12 +118,18 @@ class SharedPPOAgent:
             else:
                 next_non_terminal = 1.0
                 next_value = values[t + 1]
-
+            # Calculate TD error
             delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+
+            # Apply the mask to break the MDP chain for offline drivers ---
+            delta = delta * active_masks[t]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
             advantages[t] = last_gae_lam
 
         returns = advantages + values
+
+        # Filter out offline experiences before training ---
+        flat_masks = active_masks.view(-1).bool()
 
         flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
         flat_actions = old_actions.view(-1)
@@ -128,9 +137,17 @@ class SharedPPOAgent:
         flat_advantages = advantages.view(-1)
         flat_returns = returns.view(-1)
 
-        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-7)
+        # Only standardize advantages if we have active samples
+        if flat_advantages.shape[0] > 1:
+            flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-7)
 
         dataset_size = flat_states.size(0)
+
+        # If no drivers were online (edge case), clear buffer and skip update
+        if dataset_size == 0:
+            self.buffer.clear()
+            return
+
         for _ in range(self.ppo_epochs):
             sampler = BatchSampler(SubsetRandomSampler(range(dataset_size)), self.batch_size, drop_last=False)
             for indices in sampler:
@@ -171,7 +188,7 @@ def calculate_gini(incomes):
     if len(incomes) == 0:
         return 0.0
     # 确保没有负收入导致计算错误
-    incomes = np.clip(np.sort(incomes))
+    incomes = np.sort(incomes)
     n = len(incomes)
     index = np.arange(1, n + 1)
 
@@ -239,27 +256,10 @@ class Trainer:
             np.mean(ep_ginis)
         ])
 
-    def train(self, platform_params, num_episodes=50):
-        episode_rewards = []
-        for episode in tqdm(range(num_episodes)):
-            state = self.env.reset()
-            ep_reward = 0
-            while True:
-                actions = self.agent.select_actions(state)
-                next_state, rewards, done, info = self.env.step(actions, platform_params)
-                self.agent.buffer.rewards.append(rewards)
-                self.agent.buffer.is_terminals.append(done)
-                state = next_state
-                ep_reward += np.sum(rewards)
-                if done: break
-            self.agent.update()
-            episode_rewards.append(ep_reward)
-        self._plot_rewards(episode_rewards)
-        return episode_rewards
-
     def _plot_rewards(self, rewards,title):
         plt.plot(rewards)
         plt.savefig(f"{title}_rewards.png")
+        plt.close()  # 释放内存
 
 
 if __name__ == '__main__':
