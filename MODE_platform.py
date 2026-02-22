@@ -99,14 +99,27 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
         # 生成子代
         offspring = algorithms.varAnd(pop, toolbox, cxpb=0.9, mutpb=0.2)
 
-        # UCB 过滤
-        ucb_scores = []
+        # EVHI 过滤
+        ehvi_scores = []
+
+        # 动态计算参考点 (Reference Point)
+        if len(hof) > 0:
+            pf_fits = np.array([ind.fitness.values for ind in hof])
+            # 因为转化为最小化问题，参考点设为前沿在各维度上的最差值 (最大值)，并向外延伸 10%
+            ref_point = np.max(-pf_fits, axis=0) + np.abs(np.max(-pf_fits, axis=0)) * 0.1
+            # 防止参考点坐标为 0 导致计算异常
+            ref_point = np.where(ref_point == 0, 1e-6, ref_point)
+        else:
+            ref_point = None
+
         for ind in offspring:
             params = runner.ind_to_params(ind)
-            ucb = runner.surrogate.calculate_ucb(params, kappa=2.0)
-            ucb_scores.append(np.sum(ucb))
+            # 计算 EHVI 得分
+            score = runner.surrogate.calculate_ehvi_score(params, hof, ref_point)
+            ehvi_scores.append(score)
 
-        top_k_indices = np.argsort(ucb_scores)[-k_real_evals:]
+        # 筛选 EHVI 得分最高的 K 个个体进行真实环境评估
+        top_k_indices = np.argsort(ehvi_scores)[-k_real_evals:]
 
         for i, ind in enumerate(offspring):
             if i in top_k_indices:

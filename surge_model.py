@@ -2,6 +2,7 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 import warnings
+from deap.tools import hypervolume
 
 
 class SurrogateModel:
@@ -115,15 +116,45 @@ class SurrogateModel:
 
         return mu, std
 
-    def calculate_ucb(self, platform_params, kappa=2.0):
+    def calculate_ehvi_score(self, params, hof, ref_point, num_samples=30):
         """
-        计算置信上限 (Upper Confidence Bound)，用于指导进化算法的探索与利用。
-        公式: UCB = \mu + \kappa * \sigma
+        通过蒙特卡洛采样近似计算期望超体积改善 (EHVI)
         """
-        if not self.is_trained:
-            # 如果未训练，返回极大值强制真实评估
-            return np.array([float('inf'), float('inf'), float('inf')])
+        mu, std = self.predict(params)
 
-        mu, std = self.predict(platform_params)
-        ucb_scores = mu + kappa * std
-        return ucb_scores
+        if len(hof) == 0 or ref_point is None:
+            # 初期没有帕累托前沿时，退化为均值探索
+            return np.sum(mu)
+
+        # 提取当前帕累托前沿的适应度
+        # 注意：DEAP 的 hypervolume 函数默认求解“最小化”问题，
+        # 而我们的环境是 FitnessMax，因此需要取负号转化
+        pf_fitnesses = np.array([ind.fitness.values for ind in hof])
+        pf_minimized = -pf_fitnesses
+
+        # 计算当前的超体积 HV(P)
+        current_hv = hypervolume(pf_minimized, ref=ref_point)
+
+        # 从代理模型预测的高斯分布中进行蒙特卡洛采样
+        samples = np.random.normal(loc=mu, scale=std, size=(num_samples, len(mu)))
+
+        hvi_sum = 0.0
+        for sample in samples:
+            sample_minimized = -sample  # 同样转化为最小化视角
+
+            # 判断采样点是否被当前的帕累托前沿支配 (如果被支配，则无改善)
+            is_dominated = False
+            for pf_pt in pf_minimized:
+                if np.all(pf_pt <= sample_minimized):
+                    is_dominated = True
+                    break
+
+            if not is_dominated:
+                # 合并产生新的前沿，并计算新的超体积 HV(P U {y})
+                new_front = np.vstack((pf_minimized, sample_minimized))
+                new_hv = hypervolume(new_front, ref=ref_point)
+                # 累加增量 max(0, 新HV - 旧HV)
+                hvi_sum += max(0, new_hv - current_hv)
+
+        # 返回积分的近似期望值
+        return hvi_sum / num_samples

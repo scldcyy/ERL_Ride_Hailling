@@ -171,7 +171,7 @@ def calculate_gini(incomes):
     if len(incomes) == 0:
         return 0.0
     # 确保没有负收入导致计算错误
-    incomes = np.clip(np.sort(incomes), a_min=0, a_max=None)
+    incomes = np.clip(np.sort(incomes))
     n = len(incomes)
     index = np.arange(1, n + 1)
 
@@ -181,7 +181,7 @@ def calculate_gini(incomes):
 
     # Gini formula
     gini = (2 * np.sum(index * incomes)) / (n * total_income) - (n + 1) / n
-    return float(gini)
+    return gini
 
 class Trainer:
     def __init__(self, simulator_path, fixed_scenarios=None):
@@ -229,8 +229,9 @@ class Trainer:
                     break
             self.agent.update()
 
-        # self._plot_rewards(ep_profits)
-        # self._plot_rewards(ep_wait_times)
+        self._plot_rewards(ep_profits,"ep_profits")
+        self._plot_rewards(ep_wait_times,"ep_wait_times")
+        self._plot_rewards(ep_ginis,"ep_ginis")
 
         return np.array([
             np.mean(ep_profits),
@@ -256,9 +257,9 @@ class Trainer:
         self._plot_rewards(episode_rewards)
         return episode_rewards
 
-    def _plot_rewards(self, rewards):
+    def _plot_rewards(self, rewards,title):
         plt.plot(rewards)
-        plt.show()
+        plt.savefig(f"{title}_rewards.png")
 
 
 if __name__ == '__main__':
