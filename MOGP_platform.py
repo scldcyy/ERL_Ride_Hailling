@@ -143,37 +143,26 @@ class SAMO_GP_Runner:
             'subsidy': lambda t, no, nd, sd: safe_eval(func_subsidy, t, no, nd, sd)
         }
 
-    def evaluate_real(self, individual, num_episodes=15):
-        """在真实的 PPO 环境中评估"""
+    def evaluate_real(self, individual, num_episodes=15, init_mode=False):
         params = self.ind_to_params(individual)
-        # 真实评估，获取 [Profit, -Wait Time, -Gini]
-        if len(self.archive_params) > 0:
-            # Extract phenotype of current formula
+
+        # FIX: Bypass hot start if in init_mode
+        if len(self.archive_params) > 0 and not init_mode:
             current_pheno = self.surrogate._get_phenotype(params)
-
-            # Extract phenotypes of all historical formulas
             phenotypes = np.array([self.surrogate._get_phenotype(p) for p in self.archive_params])
-
-            # Find nearest neighbor strategy in phenotype space
             distances = np.linalg.norm(phenotypes - current_pheno, axis=1)
             best_idx = np.argmin(distances)
-
-            # Transfer parameters: load w_neighbor
             best_weights = self.archive_weights[best_idx]
             self.trainer.agent.load_by_weights(best_weights)
         else:
-            # First generation fallback
             self.trainer.reset_to_base_weights()
 
-        # Real evaluation (now requires fewer episodes to converge due to hot start)
         fitness = self.trainer.train_and_evaluate(params, num_episodes=num_episodes)
 
-        # Save to archive
         self.archive_params.append(params)
         self.archive_fitness.append(fitness[:3])
         self.archive_inds.append(individual)
-        self.archive_weights.append(self.trainer.agent.get_weights())  # Save new weights
-
+        self.archive_weights.append(self.trainer.agent.get_weights())
         return tuple(fitness[:3])
 
     def evaluate_surrogate(self, individual):
@@ -286,7 +275,7 @@ def run_samo_gp(runner, pop_size=100, n_gens=50, k_real_evals=5):
 
         print("=== Generation 0: Initializing Surrogate ===")
         for ind in pop:
-            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
+            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3, init_mode=True)
 
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
         hof.update(pop)

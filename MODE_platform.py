@@ -67,24 +67,17 @@ class SAMO_DE_Runner:
             'subsidy': lambda t, no, nd, sd: parameterized_subsidy(t, no, nd, sd, p)
         }
 
-    def evaluate_real(self, individual, num_episodes=5):
+    def evaluate_real(self, individual, num_episodes=15, init_mode=False):
         params = self.ind_to_params(individual)
-        if len(self.archive_params) > 0:
-            # Extract phenotype of current formula
+        # FIX: Bypass hot start if in init_mode
+        if len(self.archive_params) > 0 and not init_mode:
             current_pheno = self.surrogate._get_phenotype(params)
-
-            # Extract phenotypes of all historical formulas
             phenotypes = np.array([self.surrogate._get_phenotype(p) for p in self.archive_params])
-
-            # Find nearest neighbor strategy in phenotype space
             distances = np.linalg.norm(phenotypes - current_pheno, axis=1)
             best_idx = np.argmin(distances)
-
-            # Transfer parameters: load w_neighbor
             best_weights = self.archive_weights[best_idx]
             self.trainer.agent.load_by_weights(best_weights)
         else:
-            # First generation fallback
             self.trainer.reset_to_base_weights()
         fitness = self.trainer.train_and_evaluate(params, num_episodes=num_episodes)
 
@@ -182,7 +175,7 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
 
         print("=== Generation 0: Initializing Surrogate with Real Evaluations ===")
         for ind in pop:
-            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
+            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3, init_mode=True)
 
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
         hof.update(pop)

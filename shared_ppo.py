@@ -113,10 +113,10 @@ class SharedPPOAgent:
 
         for t in reversed(range(T)):
             if t == T - 1:
-                next_non_terminal = 0.0
-                next_value = 0.0
+                next_non_terminal = torch.zeros(N)
+                next_value = torch.zeros(N)
             else:
-                next_non_terminal = 1.0
+                next_non_terminal = active_masks[t + 1]
                 next_value = values[t + 1]
             # Calculate TD error
             delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]

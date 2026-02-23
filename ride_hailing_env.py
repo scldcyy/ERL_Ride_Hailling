@@ -112,10 +112,10 @@ class RideHailingEnv:
                 lat / 90.0,
                 lng / 180.0,
                 self.time / CONFIG['TIME_STEPS_PER_DAY'],
-                order_counts[loc_idx]/50,
-                idle_driver_counts[loc_idx]/50,
-                avg_n_orders,
-                avg_n_drivers,
+                order_counts[loc_idx]/ 50.0,
+                idle_driver_counts[loc_idx]/ 50.0,
+                avg_n_orders/ 50.0,
+                avg_n_drivers/ 50.0,
                 self.driver_free_time[i] / CONFIG['TIME_STEPS_PER_DAY'],
                 surge[loc_idx],
                 subsidy[loc_idx],
@@ -306,6 +306,8 @@ class RideHailingEnv:
         for i in range(CONFIG['N_DRIVERS']):
             if not self.driver_online[i]:
                 # 已下线司机：判断是否重新上线（预期收益>阈值）
+                if self.driver_type[i] == 0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']:
+                    continue
                 loc = self.driver_locations[i]
                 cur_surge = surge[loc]
                 cur_subsidy = subsidy[loc]
