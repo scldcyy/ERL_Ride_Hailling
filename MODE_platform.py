@@ -54,6 +54,7 @@ class SAMO_DE_Runner:
         self.surrogate = SurrogateModel(n_reference_states=50)
         self.archive_params = []
         self.archive_fitness = []
+        self.archive_weights = []
 
     def ind_to_params(self, individual):
         """将 DE 的连续向量映射到 platform_params 字典"""
@@ -64,8 +65,24 @@ class SAMO_DE_Runner:
         }
 
     def evaluate_real(self, individual, num_episodes=5):
-        self.trainer.reset_to_base_weights()
         params = self.ind_to_params(individual)
+        if len(self.archive_params) > 0:
+            # Extract phenotype of current formula
+            current_pheno = self.surrogate._get_phenotype(params)
+
+            # Extract phenotypes of all historical formulas
+            phenotypes = np.array([self.surrogate._get_phenotype(p) for p in self.archive_params])
+
+            # Find nearest neighbor strategy in phenotype space
+            distances = np.linalg.norm(phenotypes - current_pheno, axis=1)
+            best_idx = np.argmin(distances)
+
+            # Transfer parameters: load w_neighbor
+            best_weights = self.archive_weights[best_idx]
+            self.trainer.agent.load_by_weights(best_weights)
+        else:
+            # First generation fallback
+            self.trainer.reset_to_base_weights()
         fitness = self.trainer.train_and_evaluate(params, num_episodes=num_episodes)
 
         self.archive_params.append(params)

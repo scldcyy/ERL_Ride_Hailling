@@ -219,7 +219,7 @@ class Trainer:
 
     def train_and_evaluate(self, platform_params, num_episodes=5):
         ep_profits = []
-        # ep_completion_rates = []
+        ep_completion_rates = []
         ep_wait_times = []
         ep_ginis = []  # --- 新增：记录基尼系数 ---
 
@@ -234,30 +234,44 @@ class Trainer:
                 ep_total_profit += info['step_profit']
                 state = next_state
                 if done:
-                    # total_demand = info['total_generated'] + 1e-6
-                    # completion_rate = info['total_served'] / total_demand
+                    total_demand = info['total_generated'] + 1e-6
+                    completion_rate = info['total_served'] / total_demand
                     wait_time = -info['total_wait_time']
                     # --- 新增：计算并记录基尼系数 ---
-                    gini_index = calculate_gini(info['driver_income'])
+                    gini_index = calculate_gini(info['driver_income_rate'])
                     ep_profits.append(ep_total_profit)
-                    # ep_completion_rates.append(completion_rate)
+                    ep_completion_rates.append(completion_rate)
                     ep_wait_times.append(wait_time)
                     ep_ginis.append(-gini_index)  # 取负值以适应最大化求解器
                     break
             self.agent.update()
 
-        self._plot_rewards(ep_profits,"ep_profits")
-        self._plot_rewards(ep_wait_times,"ep_wait_times")
-        self._plot_rewards(ep_ginis,"ep_ginis")
+        # self._plot_rewards(
+        #     {
+        #         "profits": ep_profits,
+        #         "wait_times": ep_wait_times,
+        #         "ginis": ep_ginis,
+        #         "completion_rates": ep_completion_rates
+        #     }
+        # )
+
+        k = min(5, len(ep_profits))
 
         return np.array([
-            np.mean(ep_profits),
-            np.mean(ep_wait_times),
-            np.mean(ep_ginis)
+            np.mean(ep_profits[-k:]),  # 利润：取最后 k 轮平均
+            np.mean(ep_wait_times[-k:]),  # 等待时间：取最后 k 轮平均
+            np.mean(ep_ginis[-k:])  # 基尼系数：取最后 k 轮平均
         ])
 
-    def _plot_rewards(self, rewards,title):
-        plt.plot(rewards)
+    def _plot_rewards(self, kpis):
+        fig = plt.figure(figsize=(24, 6))
+        axs = [fig.add_subplot(141), fig.add_subplot(142), fig.add_subplot(143), fig.add_subplot(144)]
+        for idx,(title, kpi) in enumerate(kpis.items()):
+            ax = axs[idx]
+            ax.plot(kpi)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel('Episode')
+            ax.set_ylabel(title)
         plt.savefig(f"{title}_rewards.png")
         plt.close()  # 释放内存
 

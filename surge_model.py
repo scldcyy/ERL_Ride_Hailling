@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 import warnings
@@ -27,15 +28,19 @@ class SurrogateModel:
         self.is_trained = False
 
     def _generate_reference_states(self):
-        """生成一组固定的参考状态 (t, N_o, N_d, SD)，用于将符号公式转化为固定长度的特征向量"""
-        rng = np.random.RandomState(42)  # 固定种子保证每次运行的参考状态一致
+        """使用拉丁超立方抽样 (LHS) 生成均匀的参考状态 (t, N_o, N_d, SD)"""
+        # 3 dimensions: t, no, nd
+        sampler = qmc.LatinHypercube(d=3, seed=42)
+        lhs_samples = sampler.random(n=self.n_reference_states)
 
-        # 归一化时间 t in [0, 1]
-        t = rng.uniform(0, 1, self.n_reference_states)
-        # 订单数量 N_o
-        no = rng.uniform(0, 20, self.n_reference_states)
-        # 司机数量 N_d
-        nd = rng.uniform(0, 20, self.n_reference_states)
+        # 反归一化到实际的物理范围
+        # t in [0, 1]
+        t = lhs_samples[:, 0]
+        # N_o in [0, 20]
+        no = lhs_samples[:, 1] * 20.0
+        # N_d in [0, 20]
+        nd = lhs_samples[:, 2] * 20.0
+
         # 供需比 SD (加入 epsilon 防止除零)
         sd = no / (nd + 1e-6)
 
@@ -126,9 +131,7 @@ class SurrogateModel:
             # 初期没有帕累托前沿时，退化为均值探索
             return np.sum(mu)
 
-        # 提取当前帕累托前沿的适应度
-        # 注意：DEAP 的 hypervolume 函数默认求解“最小化”问题，
-        # 而我们的环境是 FitnessMax，因此需要取负号转化
+        # 提取当前帕累托前沿的适应度 (转化为最小化视角)
         pf_fitnesses = np.array([ind.fitness.values for ind in hof])
         pf_minimized = -pf_fitnesses
 
@@ -140,9 +143,15 @@ class SurrogateModel:
 
         hvi_sum = 0.0
         for sample in samples:
-            sample_minimized = -sample  # 同样转化为最小化视角
+            sample_minimized = -sample
 
-            # 判断采样点是否被当前的帕累托前沿支配 (如果被支配，则无改善)
+            # --- FIX 1: Reference Point Bound Check ---
+            # If the sample is worse than the reference point in ANY dimension,
+            # it contributes absolutely 0 to the hypervolume. Skip it to prevent crashes.
+            if np.any(sample_minimized >= ref_point):
+                continue
+
+            # 判断采样点是否被当前的帕累托前沿支配
             is_dominated = False
             for pf_pt in pf_minimized:
                 if np.all(pf_pt <= sample_minimized):
@@ -150,11 +159,22 @@ class SurrogateModel:
                     break
 
             if not is_dominated:
-                # 合并产生新的前沿，并计算新的超体积 HV(P U {y})
-                new_front = np.vstack((pf_minimized, sample_minimized))
-                new_hv = hypervolume(new_front, ref=ref_point)
-                # 累加增量 max(0, 新HV - 旧HV)
-                hvi_sum += max(0, new_hv - current_hv)
+                # --- FIX 2: Strict Pareto Front Maintenance ---
+                # Remove any points in the current front that are dominated BY the new sample
+                # A point is dominated by the sample if all sample dimensions are <= the point's dimensions
+                non_dominated_mask = ~np.all(pf_minimized >= sample_minimized, axis=1)
+                filtered_pf = pf_minimized[non_dominated_mask]
+
+                # Merge the filtered front with the valid new sample
+                new_front = np.vstack((filtered_pf, sample_minimized))
+
+                try:
+                    new_hv = hypervolume(new_front, ref=ref_point)
+                    hvi_sum += max(0.0, new_hv - current_hv)
+                except Exception:
+                    # Safe fallback: If DEAP throws an unexpected geometry error,
+                    # assume 0 improvement rather than crashing a 72-hour training run.
+                    pass
 
         # 返回积分的近似期望值
         return hvi_sum / num_samples

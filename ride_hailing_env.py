@@ -14,6 +14,7 @@ class RideHailingEnv:
 
         self.all_hexes = list(self.simulator.adjacency.keys())
         self.n_zones = len(self.all_hexes)
+        self.driver_active_steps = np.zeros(CONFIG['N_DRIVERS'])
         self.hex_to_idx = {h: i for i, h in enumerate(self.all_hexes)}
         self.idx_to_hex = {i: h for i, h in enumerate(self.all_hexes)}
 
@@ -51,6 +52,7 @@ class RideHailingEnv:
         # --- 重置司机异质性相关状态 ---
         self.driver_daily_income = np.zeros(CONFIG['N_DRIVERS'])
         self.driver_online = np.ones(CONFIG['N_DRIVERS'], dtype=bool)
+        self.driver_active_steps = np.zeros(CONFIG['N_DRIVERS'])
 
         self.total_revenue = 0
         self.total_served_orders = 0
@@ -180,6 +182,7 @@ class RideHailingEnv:
         freed_drivers = np.where((self.driver_status == 1) & (self.driver_free_time == 0))[0]
         self.driver_status[freed_drivers] = 0
 
+        self.driver_active_steps += self.driver_online.astype(int)
         # --- 3. 生成新订单 ---
         if self.fixed_scenarios is not None:
             raw_orders = copy.deepcopy(self.current_day_orders[self.time])
@@ -278,13 +281,14 @@ class RideHailingEnv:
 
         info = {
             'step_profit': step_profit,
-            'zone_profits': zone_profits,  # <--- 暴露局部利润
+            'zone_profits': zone_profits,
             'total_revenue': self.total_revenue,
             'total_served': self.total_served_orders,
             'total_generated': self.total_generated_orders,
             'total_wait_time': self.total_wait_time,
             'online_drivers': np.sum(self.driver_online),
-            'driver_income': self.driver_daily_income.copy()
+            'driver_income': self.driver_daily_income.copy(),
+            'driver_income_rate': self.driver_daily_income / (self.driver_active_steps + 1e-6)
         }
 
         return next_state, rewards, done, info

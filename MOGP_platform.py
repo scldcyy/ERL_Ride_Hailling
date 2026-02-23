@@ -15,17 +15,12 @@ from surge_model import SurrogateModel
 
 # --- 1. 定义受保护的数学操作 (防止 GP 生成非法数学公式导致崩溃) ---
 def protected_div(left, right):
-    try:
-        return left / right if abs(right) > 1e-6 else 1.0
-    except ZeroDivisionError:
-        return 1.0
-
+    """Safe division for both scalars and numpy arrays."""
+    return np.where(np.abs(right) > 1e-6, left / right, 1.0)
 
 def protected_log(x):
-    try:
-        return math.log(abs(x)) if abs(x) > 1e-6 else 0.0
-    except ValueError:
-        return 0.0
+    """Safe log for both scalars and numpy arrays."""
+    return np.where(np.abs(x) > 1e-6, np.log(np.abs(x)), 0.0)
 
 def gen_rand101():
     return round(np.random.uniform(-1, 1), 2)
@@ -56,32 +51,64 @@ toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
 toolbox.register("compile", gp.compile, pset=pset)
 
+def check_height_limit(individual, max_height=6):
+    """确保个体中的所有树都不超过指定的最大高度"""
+    for tree in individual:
+        if tree.height > max_height:
+            return False
+    return True
+
 # --- 新增：处理多树个体 (Multi-Tree GP) 的自定义交叉与变异 ---
-def cx_multi_tree(ind1, ind2):
+def cx_multi_tree(ind1, ind2, max_height=6):
     """
     针对包含多棵树的个体进行交叉。
-    以 50% 的概率独立交叉 Surge 树和 Subsidy 树。
+    保证至少有一棵树被交叉，另一棵有 50% 概率交叉。
+    包含防止树过度膨胀 (Bloat) 的高度限制。
     """
-    for i in range(len(ind1)):
-        if random.random() < 0.5:
-            ind1[i], ind2[i] = gp.cxOnePoint(ind1[i], ind2[i])
+    # 备份原始树以防超出高度限制
+    ind1_backup = [toolbox.clone(t) for t in ind1]
+    ind2_backup = [toolbox.clone(t) for t in ind2]
+
+    # 保证至少有一棵树被交叉
+    tree_idx = random.choice([0, 1])
+    ind1[tree_idx], ind2[tree_idx] = gp.cxOnePoint(ind1[tree_idx], ind2[tree_idx])
+
+    # 另一棵树有 50% 的概率交叉
+    other_idx = 1 - tree_idx
+    if random.random() < 0.5:
+        ind1[other_idx], ind2[other_idx] = gp.cxOnePoint(ind1[other_idx], ind2[other_idx])
+
+    # 高度限制检查，如果越界则撤销交叉
+    if not (check_height_limit(ind1, max_height) and check_height_limit(ind2, max_height)):
+        ind1[:] = ind1_backup
+        ind2[:] = ind2_backup
+
     return ind1, ind2
 
-def mut_multi_tree(individual, expr, pset):
+
+def mut_multi_tree(individual, expr, pset, max_height=6):
     """
     针对包含多棵树的个体进行变异。
-    以 50% 的概率独立变异 Surge 树和 Subsidy 树。
+    保证至少有一棵树被变异，另一棵有 50% 概率变异。
     """
-    for i in range(len(individual)):
-        if random.random() < 0.5:
-            # gp.mutUniform 返回一个元组，需要解包
-            individual[i], = gp.mutUniform(individual[i], expr=expr, pset=pset)
+    ind_backup = [toolbox.clone(t) for t in individual]
+
+    tree_idx = random.choice([0, 1])
+    individual[tree_idx], = gp.mutUniform(individual[tree_idx], expr=expr, pset=pset)
+
+    other_idx = 1 - tree_idx
+    if random.random() < 0.5:
+        individual[other_idx], = gp.mutUniform(individual[other_idx], expr=expr, pset=pset)
+
+    if not check_height_limit(individual, max_height):
+        individual[:] = ind_backup
+
     return individual,
 
 # 注册自定义的遗传操作
 toolbox.register("select", tools.selNSGA2)
-toolbox.register("mate", cx_multi_tree)
-toolbox.register("mutate", mut_multi_tree, expr=toolbox.expr, pset=pset)
+toolbox.register("mate", cx_multi_tree, max_height=6)
+toolbox.register("mutate", mut_multi_tree, expr=toolbox.expr, pset=pset, max_height=6)
 
 
 # --- 3. 评估与代理模型逻辑 ---
@@ -92,29 +119,48 @@ class SAMO_GP_Runner:
         self.archive_params = []
         self.archive_fitness = []
         self.archive_inds = []
+        self.archive_weights = []
 
     def ind_to_params(self, individual):
         """将 DEAP 个体转化为 platform_params 字典"""
         func_surge = toolbox.compile(expr=individual[0])
         func_subsidy = toolbox.compile(expr=individual[1])
-        # 包装一层以处理数组输入
         return {
             'surge': lambda t, no, nd, sd: np.vectorize(func_surge)(t, no, nd, sd),
             'subsidy': lambda t, no, nd, sd: np.vectorize(func_subsidy)(t, no, nd, sd)
         }
 
-    def evaluate_real(self, individual, num_episodes=2):
+    def evaluate_real(self, individual, num_episodes=15):
         """在真实的 PPO 环境中评估"""
-        self.trainer.reset_to_base_weights()
         params = self.ind_to_params(individual)
         # 真实评估，获取 [Profit, -Wait Time, -Gini]
-        # 注意：在此缩减 num_episodes 以加速测试。实际运行时应增加。
+        if len(self.archive_params) > 0:
+            # Extract phenotype of current formula
+            current_pheno = self.surrogate._get_phenotype(params)
+
+            # Extract phenotypes of all historical formulas
+            phenotypes = np.array([self.surrogate._get_phenotype(p) for p in self.archive_params])
+
+            # Find nearest neighbor strategy in phenotype space
+            distances = np.linalg.norm(phenotypes - current_pheno, axis=1)
+            best_idx = np.argmin(distances)
+
+            # Transfer parameters: load w_neighbor
+            best_weights = self.archive_weights[best_idx]
+            self.trainer.agent.load_by_weights(best_weights)
+        else:
+            # First generation fallback
+            self.trainer.reset_to_base_weights()
+
+        # Real evaluation (now requires fewer episodes to converge due to hot start)
         fitness = self.trainer.train_and_evaluate(params, num_episodes=num_episodes)
 
-        # 将真实数据存入档案，用于更新代理模型
+        # Save to archive
         self.archive_params.append(params)
-        self.archive_fitness.append(fitness[:3])  # 仅取前三个目标
+        self.archive_fitness.append(fitness[:3])
         self.archive_inds.append(individual)
+        self.archive_weights.append(self.trainer.agent.get_weights())  # Save new weights
+
         return tuple(fitness[:3])
 
     def evaluate_surrogate(self, individual):
@@ -125,14 +171,15 @@ class SAMO_GP_Runner:
 
 
 def save_checkpoint(gen, pop, hof, history, runner, filename="results/gp_checkpoint.pkl"):
-    """保存当前进度的快照"""
+    """保存当前进度的快照，包含热启动所需的模型权重"""
     cp_data = {
         'gen': gen,
         'pop': pop,
         'hof': hof,
         'history': history,
-        'archive_inds': runner.archive_inds,  # 存原始树结构，避开 lambda
-        'archive_fitness': runner.archive_fitness
+        'archive_inds': runner.archive_inds,
+        'archive_fitness': runner.archive_fitness,
+        'archive_weights': runner.archive_weights  # NEW: Save PPO weights for Hot Start
     }
     with open(filename, 'wb') as f:
         pickle.dump(cp_data, f)
@@ -140,7 +187,7 @@ def save_checkpoint(gen, pop, hof, history, runner, filename="results/gp_checkpo
 
 
 def load_checkpoint(filename, runner):
-    """恢复训练进度并重建环境状态"""
+    """恢复训练进度并重建环境状态，包括热启动知识库"""
     with open(filename, 'rb') as f:
         cp_data = pickle.load(f)
 
@@ -149,8 +196,63 @@ def load_checkpoint(filename, runner):
     runner.archive_fitness = cp_data['archive_fitness']
     runner.archive_params = [runner.ind_to_params(ind) for ind in runner.archive_inds]
 
+    # NEW: Restore the Hot Start knowledge base
+    # Using .get() ensures backward compatibility if you load an older checkpoint
+    runner.archive_weights = cp_data.get('archive_weights', [])
+
     print(f" [Checkpoint] Resumed from Generation {cp_data['gen']}.")
     return cp_data['gen'], cp_data['pop'], cp_data['hof'], cp_data['history']
+
+
+from scipy.spatial.distance import cdist
+
+
+def generate_lhs_initial_population(toolbox, runner, pop_size):
+    """
+    通过表现型空间的最大最小距离过滤，生成具有 LHS 特性的初始 GP 种群。
+    确保初始种群的公式在行为逻辑上具有最大的多样性。
+    """
+    print("Generating extended pool for LHS Phenotype selection...")
+    # 生成 10 倍规模的候选池
+    pool_size = pop_size * 10
+    candidate_pool = toolbox.population(n=pool_size)
+
+    phenotypes = []
+    valid_candidates = []
+
+    # 提取所有候选树的表现型
+    for ind in candidate_pool:
+        params = runner.ind_to_params(ind)
+        pheno = runner.surrogate._get_phenotype(params)
+
+        # 过滤掉全 nan 或极值溢出的无效公式
+        if not np.any(np.isnan(pheno)) and np.max(np.abs(pheno)) < 100:
+            phenotypes.append(pheno)
+            valid_candidates.append(ind)
+
+    phenotypes = np.array(phenotypes)
+
+    # 贪心 Max-Min 距离选择法 (近似 LHS 覆盖)
+    selected_indices = [random.randint(0, len(valid_candidates) - 1)]
+
+    while len(selected_indices) < pop_size:
+        # 计算所有候选点到已选集合的距离矩阵
+        selected_phenos = phenotypes[selected_indices]
+        dists = cdist(phenotypes, selected_phenos)
+
+        # 找到距离已选集合最近距离的那个点
+        min_dists = np.min(dists, axis=1)
+
+        # 将已经被选中的点距离设为 -1 排除
+        min_dists[selected_indices] = -1
+
+        # 选出该最小距离中的最大值（离当前群体最远的点）
+        next_idx = np.argmax(min_dists)
+        selected_indices.append(next_idx)
+
+    initial_pop = [valid_candidates[i] for i in selected_indices]
+    print(f"LHS Initialization complete. Selected {pop_size} diverse formulas.")
+    return initial_pop
 
 # --- 4. 主循环与辅助函数 ---
 def run_samo_gp(runner, pop_size=100, n_gens=50, k_real_evals=5):
@@ -165,7 +267,7 @@ def run_samo_gp(runner, pop_size=100, n_gens=50, k_real_evals=5):
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
     else:
         # 全新启动
-        pop = toolbox.population(n=pop_size)
+        pop = generate_lhs_initial_population(toolbox, runner, pop_size)
         hof = tools.ParetoFront()
         history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
 
@@ -301,6 +403,6 @@ if __name__ == '__main__':
         # 初始化运行器并开始进化
         runner = SAMO_GP_Runner(sim_path)
         # 参数规模按需放大 (例如 pop_size=100, n_gens=50)
-        hof, p_hist, e_hist, f_hist = run_samo_gp(runner, pop_size=50, n_gens=50, k_real_evals=5)
+        hof, p_hist, e_hist, f_hist = run_samo_gp(runner, pop_size=2, n_gens=2, k_real_evals=2)
 
         plot_and_save_results(hof, (p_hist, e_hist, f_hist))
