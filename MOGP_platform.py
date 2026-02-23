@@ -13,14 +13,18 @@ from shared_ppo import Trainer
 from surge_model import SurrogateModel
 
 
-# --- 1. 定义受保护的数学操作 (防止 GP 生成非法数学公式导致崩溃) ---
+# --- 1. 定义受保护的数学操作 ---
 def protected_div(left, right):
     """Safe division for both scalars and numpy arrays."""
-    return np.where(np.abs(right) > 1e-6, left / right, 1.0)
+    # Replace 0s with 1s in the denominator BEFORE dividing to prevent exceptions
+    safe_right = np.where(np.abs(right) > 1e-6, right, 1.0)
+    return np.where(np.abs(right) > 1e-6, left / safe_right, 1.0)
 
 def protected_log(x):
     """Safe log for both scalars and numpy arrays."""
-    return np.where(np.abs(x) > 1e-6, np.log(np.abs(x)), 0.0)
+    # Replace 0s with 1s BEFORE logging to prevent RuntimeWarnings
+    safe_x = np.where(np.abs(x) > 1e-6, np.abs(x), 1.0)
+    return np.where(np.abs(x) > 1e-6, np.log(safe_x), 0.0)
 
 def gen_rand101():
     return round(np.random.uniform(-1, 1), 2)
@@ -39,7 +43,7 @@ pset.addPrimitive(operator.sub, 2)
 pset.addPrimitive(operator.mul, 2)
 pset.addPrimitive(protected_div, 2)
 pset.addPrimitive(protected_log, 1)
-pset.addPrimitive(math.sin, 1)
+pset.addPrimitive(np.sin, 1)
 pset.addEphemeralConstant("rand101", gen_rand101)
 
 toolbox = base.Toolbox()
@@ -125,9 +129,18 @@ class SAMO_GP_Runner:
         """将 DEAP 个体转化为 platform_params 字典"""
         func_surge = toolbox.compile(expr=individual[0])
         func_subsidy = toolbox.compile(expr=individual[1])
+
+        def safe_eval(func, t, no, nd, sd):
+            # 尝试直接使用 numpy 原生数组运算
+            res = func(t, no, nd, sd)
+            # 如果生成的树是一个纯常数 (例如: 1.5)，它会返回标量，需要将其扩展为与区域数量相同的数组
+            if np.isscalar(res) or np.ndim(res) == 0:
+                res = np.full_like(no, float(res))
+            return res
+
         return {
-            'surge': lambda t, no, nd, sd: np.vectorize(func_surge)(t, no, nd, sd),
-            'subsidy': lambda t, no, nd, sd: np.vectorize(func_subsidy)(t, no, nd, sd)
+            'surge': lambda t, no, nd, sd: safe_eval(func_surge, t, no, nd, sd),
+            'subsidy': lambda t, no, nd, sd: safe_eval(func_subsidy, t, no, nd, sd)
         }
 
     def evaluate_real(self, individual, num_episodes=15):

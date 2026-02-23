@@ -124,6 +124,9 @@ class SharedPPOAgent:
             # Apply the mask to break the MDP chain for offline drivers ---
             delta = delta * active_masks[t]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+
+            #Mask last_gae_lam to prevent advantage bleed ---
+            last_gae_lam = last_gae_lam * active_masks[t]
             advantages[t] = last_gae_lam
 
         returns = advantages + values
@@ -131,11 +134,11 @@ class SharedPPOAgent:
         # Filter out offline experiences before training ---
         flat_masks = active_masks.view(-1).bool()
 
-        flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
-        flat_actions = old_actions.view(-1)
-        flat_logprobs = old_logprobs.view(-1)
-        flat_advantages = advantages.view(-1)
-        flat_returns = returns.view(-1)
+        flat_states = old_states.view(-1, CONFIG['STATE_DIM'])[flat_masks]
+        flat_actions = old_actions.view(-1)[flat_masks]
+        flat_logprobs = old_logprobs.view(-1)[flat_masks]
+        flat_advantages = advantages.view(-1)[flat_masks]
+        flat_returns = returns.view(-1)[flat_masks]
 
         # Only standardize advantages if we have active samples
         if flat_advantages.shape[0] > 1:

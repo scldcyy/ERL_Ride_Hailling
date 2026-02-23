@@ -6,6 +6,8 @@ from deap import base, creator, tools, algorithms
 import random
 import math
 
+from scipy.spatial.distance import cdist
+
 # 导入底层环境和代理模型
 from shared_ppo import Trainer
 from surge_model import SurrogateModel
@@ -54,7 +56,8 @@ class SAMO_DE_Runner:
         self.surrogate = SurrogateModel(n_reference_states=50)
         self.archive_params = []
         self.archive_fitness = []
-        self.archive_weights = []
+        self.archive_inds = []  # --- ALIGNMENT: Track DE individuals ---
+        self.archive_weights = []  # --- ALIGNMENT: Track PPO weights ---
 
     def ind_to_params(self, individual):
         """将 DE 的连续向量映射到 platform_params 字典"""
@@ -87,6 +90,8 @@ class SAMO_DE_Runner:
 
         self.archive_params.append(params)
         self.archive_fitness.append(fitness[:3])
+        self.archive_inds.append(individual)  # --- ALIGNMENT ---
+        self.archive_weights.append(self.trainer.agent.get_weights())  # --- ALIGNMENT: Actually save the weights for Hot Start! ---
         return tuple(fitness[:3])
 
     def evaluate_surrogate(self, individual):
@@ -94,48 +99,115 @@ class SAMO_DE_Runner:
         mu, _ = self.surrogate.predict(params)
         return tuple(mu)
 
+# --- ALIGNMENT: Checkpoint Functions ---
+def save_checkpoint(gen, pop, hof, history, runner, filename="results/de_checkpoint.pkl"):
+    """保存当前进度的快照，包含热启动所需的模型权重"""
+    cp_data = {
+        'gen': gen,
+        'pop': pop,
+        'hof': hof,
+        'history': history,
+        'archive_inds': runner.archive_inds,
+        'archive_fitness': runner.archive_fitness,
+        'archive_weights': runner.archive_weights
+    }
+    with open(filename, 'wb') as f:
+        pickle.dump(cp_data, f)
+    print(f" [Checkpoint] State saved at Generation {gen}.")
+
+def load_checkpoint(filename, runner):
+    """恢复训练进度并重建环境状态，包括热启动知识库"""
+    with open(filename, 'rb') as f:
+        cp_data = pickle.load(f)
+
+    runner.archive_inds = cp_data['archive_inds']
+    runner.archive_fitness = cp_data['archive_fitness']
+    runner.archive_params = [runner.ind_to_params(ind) for ind in runner.archive_inds]
+    runner.archive_weights = cp_data.get('archive_weights', [])
+
+    print(f" [Checkpoint] Resumed from Generation {cp_data['gen']}.")
+    return cp_data['gen'], cp_data['pop'], cp_data['hof'], cp_data['history']
+
+# --- ALIGNMENT: LHS Initialization ---
+def generate_lhs_initial_population(toolbox, runner, pop_size):
+    """
+    通过表现型空间的最大最小距离过滤，生成具有 LHS 特性的初始 DE 种群。
+    """
+    print("Generating extended pool for LHS Phenotype selection...")
+    pool_size = pop_size * 10
+    candidate_pool = toolbox.population(n=pool_size)
+
+    phenotypes = []
+    valid_candidates = []
+
+    for ind in candidate_pool:
+        params = runner.ind_to_params(ind)
+        pheno = runner.surrogate._get_phenotype(params)
+
+        if not np.any(np.isnan(pheno)) and np.max(np.abs(pheno)) < 100:
+            phenotypes.append(pheno)
+            valid_candidates.append(ind)
+
+    phenotypes = np.array(phenotypes)
+    selected_indices = [random.randint(0, len(valid_candidates) - 1)]
+
+    while len(selected_indices) < pop_size:
+        selected_phenos = phenotypes[selected_indices]
+        dists = cdist(phenotypes, selected_phenos)
+        min_dists = np.min(dists, axis=1)
+        min_dists[selected_indices] = -1
+        next_idx = np.argmax(min_dists)
+        selected_indices.append(next_idx)
+
+    initial_pop = [valid_candidates[i] for i in selected_indices]
+    print(f"LHS Initialization complete. Selected {pop_size} diverse vectors.")
+    return initial_pop
 
 # --- 4. 主循环 (与 GP 逻辑一致，保证公平比对) ---
+# --- 4. 主循环 ---
 def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
-    pop = toolbox.population(n=pop_size)
-    hof = tools.ParetoFront()
+    checkpoint_file = "results/de_checkpoint.pkl"
+    start_gen = 0
 
-    history_max_profit = []
-    history_max_efficiency = []
-    history_max_fairness = []
+    # 1. 尝试从断点恢复
+    if os.path.exists(checkpoint_file):
+        start_gen, pop, hof, history = load_checkpoint(checkpoint_file, runner)
+        history_max_profit, history_max_efficiency, history_max_fairness = history
+        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
+    else:
+        # 全新启动 (使用 LHS 初始化)
+        pop = generate_lhs_initial_population(toolbox, runner, pop_size)
+        hof = tools.ParetoFront()
+        history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
 
-    print("=== Generation 0: Initializing Surrogate with Real Evaluations ===")
-    for ind in pop:
-        ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
+        print("=== Generation 0: Initializing Surrogate with Real Evaluations ===")
+        for ind in pop:
+            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
 
-    runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-    hof.update(pop)
+        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
+        hof.update(pop)
 
-    for gen in range(1, n_gens + 1):
+        save_checkpoint(0, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
+                        checkpoint_file)
+
+    # 2. 从断点处继续进化循环
+    for gen in range(start_gen + 1, n_gens + 1):
         print(f"\n=== Generation {gen}/{n_gens} (MO-DE) ===")
-        # 生成子代
         offspring = algorithms.varAnd(pop, toolbox, cxpb=0.9, mutpb=0.2)
 
-        # EVHI 过滤
         ehvi_scores = []
-
-        # 动态计算参考点 (Reference Point)
         if len(hof) > 0:
             pf_fits = np.array([ind.fitness.values for ind in hof])
-            # 因为转化为最小化问题，参考点设为前沿在各维度上的最差值 (最大值)，并向外延伸 10%
             ref_point = np.max(-pf_fits, axis=0) + np.abs(np.max(-pf_fits, axis=0)) * 0.1
-            # 防止参考点坐标为 0 导致计算异常
             ref_point = np.where(ref_point == 0, 1e-6, ref_point)
         else:
             ref_point = None
 
         for ind in offspring:
             params = runner.ind_to_params(ind)
-            # 计算 EHVI 得分
             score = runner.surrogate.calculate_ehvi_score(params, hof, ref_point)
             ehvi_scores.append(score)
 
-        # 筛选 EHVI 得分最高的 K 个个体进行真实环境评估
         top_k_indices = np.argsort(ehvi_scores)[-k_real_evals:]
 
         for i, ind in enumerate(offspring):
@@ -145,8 +217,6 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
                 ind.fitness.values = runner.evaluate_surrogate(ind)
 
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-
-        # NSGA-II 环境选择
         pop = toolbox.select(pop + offspring, k=pop_size)
         hof.update(pop)
 
@@ -156,6 +226,10 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
         history_max_fairness.append(np.max(current_archive[:, 2]))
 
         print(f"Gen {gen} Best Profit: {history_max_profit[-1]:.2f}")
+
+        # --- ALIGNMENT: Save Checkpoint ---
+        save_checkpoint(gen, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
+                        checkpoint_file)
 
     return hof, history_max_profit, history_max_efficiency, history_max_fairness
 

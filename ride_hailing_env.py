@@ -201,7 +201,15 @@ class RideHailingEnv:
                 new_orders.append(o)
 
         # --- 4. 更新待匹配订单 ---
-        self.pending_orders = [o for o in self.pending_orders if not o['matched'] and o['wait_time'] < 3]
+        surviving_orders = []
+        for o in self.pending_orders:
+            if not o['matched'] and o['wait_time'] < 4:
+                # the more expensive, the higher chance to drop
+                if np.random.rand() > 0.05*surge[o['origin_idx']]:
+                    surviving_orders.append(o)
+
+        self.pending_orders = surviving_orders
+
         for o in self.pending_orders:
             o['wait_time'] += 1
             self.total_wait_time += 1
@@ -293,7 +301,7 @@ class RideHailingEnv:
 
         return next_state, rewards, done, info
 
-    def _update_driver_online_status(self, surge,subsidy):
+    def _update_driver_online_status(self, surge, subsidy):
         """更新司机上下线状态：兼职司机达到收入目标下线，低收益时司机不上线"""
         for i in range(CONFIG['N_DRIVERS']):
             if not self.driver_online[i]:
@@ -310,6 +318,8 @@ class RideHailingEnv:
 
             # 在线司机：兼职司机达到收入目标则下线
             if self.driver_type[i] == 0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']:
-                self.driver_online[i] = False
-                self.driver_status[i] = 0  # 强制设为空闲
-                self.driver_free_time[i] = 0
+                # Ensure driver is not currently serving a trip ---
+                if self.driver_free_time[i] == 0:
+                    self.driver_online[i] = False
+                    self.driver_status[i] = 0  # 强制设为空闲
+                    self.driver_free_time[i] = 0
