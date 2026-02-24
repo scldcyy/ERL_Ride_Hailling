@@ -10,7 +10,7 @@ from scipy.spatial.distance import cdist
 
 # 导入底层环境和代理模型
 from shared_ppo import Trainer
-from surge_model import SurrogateModel
+from surrogate_model import SurrogateModel
 
 
 # --- 1. 定义 DE 优化的固定公式模板 ---
@@ -67,7 +67,7 @@ class SAMO_DE_Runner:
             'subsidy': lambda t, no, nd, sd: parameterized_subsidy(t, no, nd, sd, p)
         }
 
-    def evaluate_real(self, individual, num_episodes=15, init_mode=False):
+    def evaluate_real(self, individual, num_episodes=10, init_mode=False):
         params = self.ind_to_params(individual)
         # FIX: Bypass hot start if in init_mode
         if len(self.archive_params) > 0 and not init_mode:
@@ -92,34 +92,18 @@ class SAMO_DE_Runner:
         mu, _ = self.surrogate.predict(params)
         return tuple(mu)
 
-# --- ALIGNMENT: Checkpoint Functions ---
-def save_checkpoint(gen, pop, hof, history, runner, filename="results/de_checkpoint.pkl"):
-    """保存当前进度的快照，包含热启动所需的模型权重"""
-    cp_data = {
+def save_metrics(gen, hof, history, filename="results/de_metrics.pkl"):
+    """仅保存帕累托前沿个体的参数和当前的收敛历史曲线"""
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    metrics_data = {
         'gen': gen,
-        'pop': pop,
-        'hof': hof,
-        'history': history,
-        'archive_inds': runner.archive_inds,
-        'archive_fitness': runner.archive_fitness,
-        'archive_weights': runner.archive_weights
+        'pareto_front_params': [list(ind) for ind in hof],
+        'pareto_fitness': [ind.fitness.values for ind in hof],
+        'history': history
     }
     with open(filename, 'wb') as f:
-        pickle.dump(cp_data, f)
-    print(f" [Checkpoint] State saved at Generation {gen}.")
-
-def load_checkpoint(filename, runner):
-    """恢复训练进度并重建环境状态，包括热启动知识库"""
-    with open(filename, 'rb') as f:
-        cp_data = pickle.load(f)
-
-    runner.archive_inds = cp_data['archive_inds']
-    runner.archive_fitness = cp_data['archive_fitness']
-    runner.archive_params = [runner.ind_to_params(ind) for ind in runner.archive_inds]
-    runner.archive_weights = cp_data.get('archive_weights', [])
-
-    print(f" [Checkpoint] Resumed from Generation {cp_data['gen']}.")
-    return cp_data['gen'], cp_data['pop'], cp_data['hof'], cp_data['history']
+        pickle.dump(metrics_data, f)
+    print(f" [Save] Pareto front and metrics saved at Generation {gen}.")
 
 # --- ALIGNMENT: LHS Initialization ---
 def generate_lhs_initial_population(toolbox, runner, pop_size):
@@ -142,6 +126,12 @@ def generate_lhs_initial_population(toolbox, runner, pop_size):
             valid_candidates.append(ind)
 
     phenotypes = np.array(phenotypes)
+
+    # --- 修复 1：动态调整实际挑选数量 ---
+    actual_pop_size = min(pop_size, len(valid_candidates))
+    if actual_pop_size == 0:
+        raise ValueError("致命错误: 未能生成任何有效的 DE 初始向量！")
+
     selected_indices = [random.randint(0, len(valid_candidates) - 1)]
 
     while len(selected_indices) < pop_size:
@@ -157,34 +147,27 @@ def generate_lhs_initial_population(toolbox, runner, pop_size):
     return initial_pop
 
 # --- 4. 主循环 (与 GP 逻辑一致，保证公平比对) ---
-# --- 4. 主循环 ---
 def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
-    checkpoint_file = "results/de_checkpoint.pkl"
-    start_gen = 0
+    metrics_file = "results/de_metrics.pkl"
 
-    # 1. 尝试从断点恢复
-    if os.path.exists(checkpoint_file):
-        start_gen, pop, hof, history = load_checkpoint(checkpoint_file, runner)
-        history_max_profit, history_max_efficiency, history_max_fairness = history
-        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-    else:
-        # 全新启动 (使用 LHS 初始化)
-        pop = generate_lhs_initial_population(toolbox, runner, pop_size)
-        hof = tools.ParetoFront()
-        history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
+    # 全新启动 (使用 LHS 初始化)
+    pop = generate_lhs_initial_population(toolbox, runner, pop_size)
+    hof = tools.ParetoFront()
+    history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
 
-        print("=== Generation 0: Initializing Surrogate with Real Evaluations ===")
-        for ind in pop:
-            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3, init_mode=True)
+    print("=== Generation 0: Initializing Surrogate with Real Evaluations ===")
+    for ind in pop:
+        ind.fitness.values = runner.evaluate_real(ind, num_episodes=10, init_mode=True)
+        ind.is_real_evaluated = True  # <-- 打上真实评估标签
 
-        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-        hof.update(pop)
+    runner.surrogate.update(runner.archive_params, runner.archive_fitness)
+    hof.update(pop)
 
-        save_checkpoint(0, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
-                        checkpoint_file)
+    # 初始代保存
+    save_metrics(0, hof, (history_max_profit, history_max_efficiency, history_max_fairness), metrics_file)
 
-    # 2. 从断点处继续进化循环
-    for gen in range(start_gen + 1, n_gens + 1):
+    # 进化循环
+    for gen in range(1, n_gens + 1):
         print(f"\n=== Generation {gen}/{n_gens} (MO-DE) ===")
         offspring = algorithms.varAnd(pop, toolbox, cxpb=0.9, mutpb=0.2)
 
@@ -205,13 +188,18 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
 
         for i, ind in enumerate(offspring):
             if i in top_k_indices:
-                ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
+                ind.fitness.values = runner.evaluate_real(ind, num_episodes=10)
+                ind.is_real_evaluated = True  # <-- 真实评估
             else:
                 ind.fitness.values = runner.evaluate_surrogate(ind)
+                ind.is_real_evaluated = False  # <-- 代理预测，打上假标签
 
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
         pop = toolbox.select(pop + offspring, k=pop_size)
-        hof.update(pop)
+        # --- 修复 2：严格守卫 DE 的帕累托前沿 ---
+        real_evaluated_inds = [ind for ind in (pop + offspring) if getattr(ind, 'is_real_evaluated', False)]
+        if real_evaluated_inds:
+            hof.update(real_evaluated_inds)
 
         current_archive = np.array(runner.archive_fitness)
         history_max_profit.append(np.max(current_archive[:, 0]))
@@ -220,9 +208,8 @@ def run_samo_de(runner, pop_size=40, n_gens=20, k_real_evals=5):
 
         print(f"Gen {gen} Best Profit: {history_max_profit[-1]:.2f}")
 
-        # --- ALIGNMENT: Save Checkpoint ---
-        save_checkpoint(gen, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
-                        checkpoint_file)
+        # --- 每代结束只保存轻量级指标 ---
+        save_metrics(gen, hof, (history_max_profit, history_max_efficiency, history_max_fairness), metrics_file)
 
     return hof, history_max_profit, history_max_efficiency, history_max_fairness
 
@@ -295,5 +282,5 @@ if __name__ == '__main__':
         print(f"Simulator file not found at {sim_path}")
     else:
         runner = SAMO_DE_Runner(sim_path)
-        hof, p_hist, e_hist, f_hist = run_samo_de(runner, pop_size=50, n_gens=50, k_real_evals=5)
+        hof, p_hist, e_hist, f_hist = run_samo_de(runner, pop_size=50, n_gens=50, k_real_evals=10)
         plot_and_save_results(hof, (p_hist, e_hist, f_hist))

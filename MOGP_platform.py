@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 from deap import base, creator, tools, gp, algorithms
 import operator
 import math
-
+from scipy.spatial.distance import cdist
 # 导入底层环境和代理模型
 from shared_ppo import Trainer
-from surge_model import SurrogateModel
+from surrogate_model import SurrogateModel
 
 
 # --- 1. 定义受保护的数学操作 ---
@@ -143,8 +143,11 @@ class SAMO_GP_Runner:
             'subsidy': lambda t, no, nd, sd: safe_eval(func_subsidy, t, no, nd, sd)
         }
 
-    def evaluate_real(self, individual, num_episodes=15, init_mode=False):
+    def evaluate_real(self, individual, num_episodes=10, init_mode=False):
         params = self.ind_to_params(individual)
+
+        self.trainer.reset_to_base_weights()
+        self.trainer.agent.optimizer.state.clear()
 
         # FIX: Bypass hot start if in init_mode
         if len(self.archive_params) > 0 and not init_mode:
@@ -154,8 +157,7 @@ class SAMO_GP_Runner:
             best_idx = np.argmin(distances)
             best_weights = self.archive_weights[best_idx]
             self.trainer.agent.load_by_weights(best_weights)
-        else:
-            self.trainer.reset_to_base_weights()
+
 
         fitness = self.trainer.train_and_evaluate(params, num_episodes=num_episodes)
 
@@ -172,41 +174,19 @@ class SAMO_GP_Runner:
         return tuple(mu)
 
 
-def save_checkpoint(gen, pop, hof, history, runner, filename="results/gp_checkpoint.pkl"):
-    """保存当前进度的快照，包含热启动所需的模型权重"""
-    cp_data = {
+def save_metrics(gen, hof, history, filename="results/gp_metrics.pkl"):
+    """仅保存帕累托前沿的公式字符串和当前的收敛历史曲线"""
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    metrics_data = {
         'gen': gen,
-        'pop': pop,
-        'hof': hof,
-        'history': history,
-        'archive_inds': runner.archive_inds,
-        'archive_fitness': runner.archive_fitness,
-        'archive_weights': runner.archive_weights  # NEW: Save PPO weights for Hot Start
+        'pareto_front_formulas': [(str(ind[0]), str(ind[1])) for ind in hof],
+        'pareto_fitness': [ind.fitness.values for ind in hof],
+        'history': history
     }
     with open(filename, 'wb') as f:
-        pickle.dump(cp_data, f)
-    print(f" [Checkpoint] State saved at Generation {gen}.")
+        pickle.dump(metrics_data, f)
+    print(f" [Save] Pareto front formulas and metrics saved at Generation {gen}.")
 
-
-def load_checkpoint(filename, runner):
-    """恢复训练进度并重建环境状态，包括热启动知识库"""
-    with open(filename, 'rb') as f:
-        cp_data = pickle.load(f)
-
-    # 重建代理模型所需的 archive_params (将树结构重新编译为 lambda)
-    runner.archive_inds = cp_data['archive_inds']
-    runner.archive_fitness = cp_data['archive_fitness']
-    runner.archive_params = [runner.ind_to_params(ind) for ind in runner.archive_inds]
-
-    # NEW: Restore the Hot Start knowledge base
-    # Using .get() ensures backward compatibility if you load an older checkpoint
-    runner.archive_weights = cp_data.get('archive_weights', [])
-
-    print(f" [Checkpoint] Resumed from Generation {cp_data['gen']}.")
-    return cp_data['gen'], cp_data['pop'], cp_data['hof'], cp_data['history']
-
-
-from scipy.spatial.distance import cdist
 
 
 def generate_lhs_initial_population(toolbox, runner, pop_size):
@@ -232,12 +212,21 @@ def generate_lhs_initial_population(toolbox, runner, pop_size):
             phenotypes.append(pheno)
             valid_candidates.append(ind)
 
+    # --- FIX 1: 防止合法公式不足导致的无限死循环 ---
+    actual_pop_size = min(pop_size, len(valid_candidates))
+    if actual_pop_size == 0:
+         raise ValueError("致命错误: 未能生成任何有效的候选公式，请检查树的生成约束！")
+    elif actual_pop_size < pop_size:
+         print(f"警告: 有效候选公式数量 ({len(valid_candidates)}) 少于预期的种群规模 ({pop_size})。将使用截断后的数量。")
+    # ---------------------------------------------
+
     phenotypes = np.array(phenotypes)
 
     # 贪心 Max-Min 距离选择法 (近似 LHS 覆盖)
     selected_indices = [random.randint(0, len(valid_candidates) - 1)]
 
-    while len(selected_indices) < pop_size:
+    # 使用 actual_pop_size 作为循环终止条件
+    while len(selected_indices) < actual_pop_size:
         # 计算所有候选点到已选集合的距离矩阵
         selected_phenos = phenotypes[selected_indices]
         dists = cdist(phenotypes, selected_phenos)
@@ -253,73 +242,72 @@ def generate_lhs_initial_population(toolbox, runner, pop_size):
         selected_indices.append(next_idx)
 
     initial_pop = [valid_candidates[i] for i in selected_indices]
-    print(f"LHS Initialization complete. Selected {pop_size} diverse formulas.")
+    print(f"LHS Initialization complete. Selected {actual_pop_size} diverse formulas.")
     return initial_pop
 
 # --- 4. 主循环与辅助函数 ---
 def run_samo_gp(runner, pop_size=100, n_gens=50, k_real_evals=5):
-    checkpoint_file = "results/gp_checkpoint.pkl"
-    start_gen = 0
+    metrics_file = "results/gp_metrics.pkl"
 
-    # 1. 尝试从断点恢复
-    if os.path.exists(checkpoint_file):
-        start_gen, pop, hof, history = load_checkpoint(checkpoint_file, runner)
-        history_max_profit, history_max_efficiency, history_max_fairness = history
-        # 恢复代理模型状态
-        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-    else:
-        # 全新启动
-        pop = generate_lhs_initial_population(toolbox, runner, pop_size)
-        hof = tools.ParetoFront()
-        history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
+    # 全新启动
+    pop = generate_lhs_initial_population(toolbox, runner, pop_size)
+    hof = tools.ParetoFront()
+    history_max_profit, history_max_efficiency, history_max_fairness = [], [], []
 
-        print("=== Generation 0: Initializing Surrogate ===")
-        for ind in pop:
-            ind.fitness.values = runner.evaluate_real(ind, num_episodes=3, init_mode=True)
+    print("=== Generation 0: Initializing Surrogate ===")
+    for ind in pop:
+        ind.fitness.values = runner.evaluate_real(ind, num_episodes=10, init_mode=True)
+        # --- FIX 2.1: 标记初始种群为真实评估 ---
+        ind.is_real_evaluated = True
 
-        runner.surrogate.update(runner.archive_params, runner.archive_fitness)
-        hof.update(pop)
+    runner.surrogate.update(runner.archive_params, runner.archive_fitness)
 
-        # 初始代保存一下
-        save_checkpoint(0, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
-                        checkpoint_file)
+    # 初始化时，所有的个体都是真实评估的，直接更新 hof
+    hof.update(pop)
 
-    # 2. 从断点处继续进化循环
-    for gen in range(start_gen + 1, n_gens + 1):
+    # 初始代保存
+    save_metrics(0, hof, (history_max_profit, history_max_efficiency, history_max_fairness), metrics_file)
+
+    # 进化循环
+    for gen in range(1, n_gens + 1):
         print(f"\n=== Generation {gen}/{n_gens} ===")
-        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.9, mutpb=0.1)
+        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.8, mutpb=0.3)
 
-        # EVHI 过滤
         ehvi_scores = []
-
-        # 动态计算参考点 (Reference Point)
         if len(hof) > 0:
             pf_fits = np.array([ind.fitness.values for ind in hof])
-            # 因为转化为最小化问题，参考点设为前沿在各维度上的最差值 (最大值)，并向外延伸 10%
             ref_point = np.max(-pf_fits, axis=0) + np.abs(np.max(-pf_fits, axis=0)) * 0.1
-            # 防止参考点坐标为 0 导致计算异常
             ref_point = np.where(ref_point == 0, 1e-6, ref_point)
         else:
             ref_point = None
 
         for ind in offspring:
             params = runner.ind_to_params(ind)
-            # 计算 EHVI 得分
             score = runner.surrogate.calculate_ehvi_score(params, hof, ref_point)
             ehvi_scores.append(score)
 
-        # 筛选 EHVI 得分最高的 K 个个体进行真实环境评估
         top_k_indices = np.argsort(ehvi_scores)[-k_real_evals:]
 
         for i, ind in enumerate(offspring):
             if i in top_k_indices:
-                ind.fitness.values = runner.evaluate_real(ind, num_episodes=3)
+                ind.fitness.values = runner.evaluate_real(ind, num_episodes=10)
+                # --- FIX 2.2: 只有这部分是被真实环境评估过的 ---
+                ind.is_real_evaluated = True
             else:
                 ind.fitness.values = runner.evaluate_surrogate(ind)
+                # --- FIX 2.2: 代理模型预测的适应度，打上伪造标签 ---
+                ind.is_real_evaluated = False
 
         runner.surrogate.update(runner.archive_params, runner.archive_fitness)
+
+        # 种群选择：代理评估和真实评估的个体都可以参与下一代的角逐
         pop = toolbox.select(pop + offspring, k=pop_size)
-        hof.update(pop)
+
+        # --- FIX 2.3: 严格守卫帕累托前沿！只允许真实评估的个体进入 ---
+        real_evaluated_inds = [ind for ind in (pop + offspring) if getattr(ind, 'is_real_evaluated', False)]
+        if real_evaluated_inds:
+            hof.update(real_evaluated_inds)
+        # --------------------------------------------------------
 
         current_archive = np.array(runner.archive_fitness)
         history_max_profit.append(np.max(current_archive[:, 0]))
@@ -328,12 +316,10 @@ def run_samo_gp(runner, pop_size=100, n_gens=50, k_real_evals=5):
 
         print(f"Gen {gen} Best Profit: {history_max_profit[-1]:.2f}")
 
-        # --- 每代结束自动保存 Checkpoint ---
-        save_checkpoint(gen, pop, hof, (history_max_profit, history_max_efficiency, history_max_fairness), runner,
-                        checkpoint_file)
+        # --- 每代结束只保存轻量级指标 ---
+        save_metrics(gen, hof, (history_max_profit, history_max_efficiency, history_max_fairness), metrics_file)
 
     return hof, history_max_profit, history_max_efficiency, history_max_fairness
-
 
 def plot_and_save_results(hof, history, save_dir="results"):
     os.makedirs(save_dir, exist_ok=True)
@@ -405,6 +391,6 @@ if __name__ == '__main__':
         # 初始化运行器并开始进化
         runner = SAMO_GP_Runner(sim_path)
         # 参数规模按需放大 (例如 pop_size=100, n_gens=50)
-        hof, p_hist, e_hist, f_hist = run_samo_gp(runner, pop_size=2, n_gens=2, k_real_evals=2)
+        hof, p_hist, e_hist, f_hist = run_samo_gp(runner, pop_size=50, n_gens=50, k_real_evals=10)
 
         plot_and_save_results(hof, (p_hist, e_hist, f_hist))

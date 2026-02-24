@@ -179,7 +179,7 @@ class SharedPPOAgent:
         self.buffer.clear()
 
     def get_weights(self):
-        return self.policy.state_dict(), self.policy_old.state_dict()
+        return copy.deepcopy(self.policy.state_dict()), copy.deepcopy(self.policy_old.state_dict())
 
     def load_by_weights(self, weights):
         self.policy.load_state_dict(weights[0])
@@ -191,7 +191,7 @@ def calculate_gini(incomes):
     if len(incomes) == 0:
         return 0.0
     # 确保没有负收入导致计算错误
-    incomes = np.sort(incomes)
+    incomes = np.sort(np.clip(incomes, 0, None))
     n = len(incomes)
     index = np.arange(1, n + 1)
 
@@ -249,14 +249,14 @@ class Trainer:
                     break
             self.agent.update()
 
-        # self._plot_rewards(
-        #     {
-        #         "profits": ep_profits,
-        #         "wait_times": ep_wait_times,
-        #         "ginis": ep_ginis,
-        #         "completion_rates": ep_completion_rates
-        #     }
-        # )
+        self._plot_rewards(
+            {
+                "profits": ep_profits,
+                "wait_times": ep_wait_times,
+                "ginis": ep_ginis,
+                "completion_rates": ep_completion_rates
+            }
+        )
 
         k = min(5, len(ep_profits))
 

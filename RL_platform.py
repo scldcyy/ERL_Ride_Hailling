@@ -50,7 +50,7 @@ class PlatformActorCritic(nn.Module):
 
 
 class PlatformPPOAgent:
-    def __init__(self, state_dim=4, action_dim=2, hidden_dim=128):
+    def __init__(self, state_dim=7, action_dim=2, hidden_dim=128):
         self.policy = PlatformActorCritic(state_dim, action_dim, hidden_dim)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=3e-4)
         self.policy_old = PlatformActorCritic(state_dim, action_dim, hidden_dim)
@@ -131,8 +131,9 @@ class PlatformPPOAgent:
 
 # --- 2. 桥接机制：将平台 RL 包装为 lambda 函数供底层调用 ---
 class RLPlatformPolicy:
-    def __init__(self, agent):
+    def __init__(self, agent, preference_weights):
         self.agent = agent
+        self.weights = preference_weights
         self.current_surge = None
         self.current_subsidy = None
         self.last_t = -1
@@ -142,7 +143,13 @@ class RLPlatformPolicy:
         if t != self.last_t:
             n_zones = len(no)
             t_array = np.full(n_zones, t)
-            states = np.stack([t_array, no/50.0, nd/50.0, sd], axis=-1)
+            # 将 3 维权重扩展并拼接到每个区域的状态中
+            w1 = np.full(n_zones, self.weights[0])
+            w2 = np.full(n_zones, self.weights[1])
+            w3 = np.full(n_zones, self.weights[2])
+
+            # 现在的 state 是 7 维
+            states = np.stack([t_array, no / 50.0, nd / 50.0, sd, w1, w2, w3], axis=-1)
 
             self.current_surge, self.current_subsidy = self.agent.select_actions(states)
             self.last_t = t
@@ -167,7 +174,12 @@ def train_marl(sim_path, num_episodes=50):
     print("=== Starting Rescued Bi-level MARL Training ===")
     for ep in tqdm(range(num_episodes)):
         state = trainer.env.reset()
-        rl_policy = RLPlatformPolicy(platform_agent)
+
+        # 1. 使用 Dirichlet 分布随机采样和为 1 的权重向量
+        # 例如: [0.8, 0.1, 0.1] (侧重利润) 或 [0.33, 0.33, 0.33] (均衡)
+        pref_weights = np.random.dirichlet(np.ones(3))
+
+        rl_policy = RLPlatformPolicy(platform_agent, pref_weights)
 
         platform_params = {'surge': rl_policy.surge, 'subsidy': rl_policy.subsidy}
         ep_total_profit = 0
@@ -185,8 +197,16 @@ def train_marl(sim_path, num_episodes=50):
             # 使用未匹配订单量作为效率的实时负面惩罚 (-Wait Time Proxy)
             unfulfilled_penalty = rl_policy.current_no * -0.5 if rl_policy.current_no is not None else np.zeros(277)
 
-            # 将每个区域的局部利润和效率惩罚组合为一个 (N_ZONES,) 的 Numpy 数组
-            local_step_reward = (zone_profits / 100.0) + unfulfilled_penalty
+            # 获取原生的三个独立奖励向量 (N_ZONES,)
+            r_profit = zone_profits / 100.0
+            r_efficiency = unfulfilled_penalty  # 负的等待时间代理
+            r_fairness = np.zeros(277)  # 过程中通常公平性为0，只有终局有
+
+            # 2. 根据当前 Episode 的随机偏好进行加权组合！
+            local_step_reward = (pref_weights[0] * r_profit +
+                                 pref_weights[1] * r_efficiency +
+                                 pref_weights[2] * r_fairness)
+
             platform_agent.rewards.append(local_step_reward)
             # ============================================================
 

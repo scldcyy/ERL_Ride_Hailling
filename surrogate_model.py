@@ -131,12 +131,22 @@ class SurrogateModel:
             # 初期没有帕累托前沿时，退化为均值探索
             return np.sum(mu)
 
-        # 提取当前帕累托前沿的适应度 (转化为最小化视角)
-        pf_fitnesses = np.array([ind.fitness.values for ind in hof])
-        pf_minimized = -pf_fitnesses
+        # --- FIX: 创建 Dummy 对象以满足 DEAP 底层 hypervolume 函数的调用要求 ---
+        class DummyFitness:
+            def __init__(self, wvalues):
+                self.wvalues = wvalues
 
-        # 计算当前的超体积 HV(P)
-        current_hv = hypervolume(pf_minimized, ref=ref_point)
+        class DummyInd:
+            def __init__(self, wvalues):
+                self.fitness = DummyFitness(wvalues)
+
+        # ------------------------------------------------------------------------
+
+        # current_hv 可以直接传入 hof 计算，因为 hof 里面都是原生的 DEAP 个体
+        current_hv = hypervolume(hof, ref=ref_point)
+
+        # 提取当前帕累托前沿的真实适应度 (最大化视角)
+        pf_fitnesses = np.array([ind.fitness.values for ind in hof])
 
         # 从代理模型预测的高斯分布中进行蒙特卡洛采样
         samples = np.random.normal(loc=mu, scale=std, size=(num_samples, len(mu)))
@@ -145,36 +155,34 @@ class SurrogateModel:
         for sample in samples:
             sample_minimized = -sample
 
-            # --- FIX 1: Reference Point Bound Check ---
-            # If the sample is worse than the reference point in ANY dimension,
-            # it contributes absolutely 0 to the hypervolume. Skip it to prevent crashes.
+            # 边界检查：如果样本在最小化视角下比参考点还要差，超体积贡献绝对为 0，跳过
             if np.any(sample_minimized >= ref_point):
                 continue
 
-            # 判断采样点是否被当前的帕累托前沿支配
+            # 判断采样点是否被当前的帕累托前沿支配 (最大化视角：全方位劣于旧点)
             is_dominated = False
-            for pf_pt in pf_minimized:
-                if np.all(pf_pt <= sample_minimized):
+            for pf_pt in pf_fitnesses:
+                if np.all(pf_pt >= sample):
                     is_dominated = True
                     break
 
             if not is_dominated:
-                # --- FIX 2: Strict Pareto Front Maintenance ---
-                # Remove any points in the current front that are dominated BY the new sample
-                # A point is dominated by the sample if all sample dimensions are <= the point's dimensions
-                non_dominated_mask = ~np.all(pf_minimized >= sample_minimized, axis=1)
-                filtered_pf = pf_minimized[non_dominated_mask]
+                # 严格维护：剔除掉被当前 sample 反向支配的旧帕累托点
+                non_dominated_mask = ~np.all(sample >= pf_fitnesses, axis=1)
+                filtered_pf = pf_fitnesses[non_dominated_mask]
 
-                # Merge the filtered front with the valid new sample
-                new_front = np.vstack((filtered_pf, sample_minimized))
+                # 合并出新的前沿面 (纯数值 array)
+                new_front_values = np.vstack((filtered_pf, sample))
+
+                # 将 numpy array 逐个包装为 DEAP 可识别的 Dummy 个体
+                new_front_inds = [DummyInd(tuple(val)) for val in new_front_values]
 
                 try:
-                    new_hv = hypervolume(new_front, ref=ref_point)
+                    new_hv = hypervolume(new_front_inds, ref=ref_point)
                     hvi_sum += max(0.0, new_hv - current_hv)
                 except Exception:
-                    # Safe fallback: If DEAP throws an unexpected geometry error,
-                    # assume 0 improvement rather than crashing a 72-hour training run.
-                    pass
+                    # 容错处理：若发生严重几何异常，跳过此样本以保护长期训练不中断
+                    print("Warning: Geometric error detected in hypervolume calculation. Skipping this sample.")
 
         # 返回积分的近似期望值
         return hvi_sum / num_samples

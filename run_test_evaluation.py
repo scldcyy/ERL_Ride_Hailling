@@ -2,115 +2,229 @@ import os
 import pickle
 import numpy as np
 import torch
-from deap import gp
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from basic_config import CONFIG
-from ride_hailing_env import RideHailingEnv
-from shared_ppo import Trainer, calculate_gini
+# 导入你的底层环境和 RL 策略网络
+from shared_ppo import Trainer
 from RL_platform import PlatformPPOAgent, RLPlatformPolicy
 from MODE_platform import parameterized_surge, parameterized_subsidy
-# 导入 GP 必须的算子环境
-from MOGP_platform import pset, toolbox
 
 
-def evaluate_policy_on_test_env(sim_path, platform_params, num_test_episodes=5):
-    """在固定随机种子的测试环境中评估策略"""
-    env = RideHailingEnv(sim_path)
-    trainer = Trainer(simulator_path=sim_path)  # 复用底层已训练好的司机 PPO (此处省略加载底层权重的代码，假设用同一套)
-
-    test_profits, test_efficiencies, test_fairnesses = [], [], []
-
-    for i in range(num_test_episodes):
-        # 强制固定测试集的全局种子，保证每个算法遇到的订单生成、位置初始化完全一致
-        np.random.seed(2026 + i)
-        torch.manual_seed(2026 + i)
-
-        state = trainer.env.reset()
-        ep_total_profit = 0
-
-        while True:
-            # 使用决定性动作评估（argmax），消除底层的探索噪音
-            actions = trainer.agent.select_actions(state)
-            next_state, rewards, done, info = trainer.env.step(actions, platform_params)
-            ep_total_profit += info['step_profit']
-            state = next_state
-
-            if done:
-                wait_time = -info['total_wait_time']
-                gini_index = calculate_gini(info['driver_income'])
-
-                test_profits.append(ep_total_profit)
-                test_efficiencies.append(wait_time)
-                test_fairnesses.append(-gini_index)
-                break
-
-    return np.mean(test_profits), np.mean(test_efficiencies), np.mean(test_fairnesses)
+# --- 1. 还原 MOGP 字符串公式的辅助函数 ---
+# 必须提供与 DEAP 注册时完全一致的受保护数学算子，以便使用 eval() 执行字符串
+def protected_div(left, right):
+    safe_right = np.where(np.abs(right) > 1e-6, right, 1.0)
+    return np.where(np.abs(right) > 1e-6, left / safe_right, 1.0)
 
 
-def run_fair_benchmark(sim_path, save_dir="results"):
-    print("=== Starting Fair Test Set Evaluation ===")
-    test_results = {}
-
-    # 1. 评估 SAMO-GP 测试集前沿
-    gp_path = f"{save_dir}/samogp_results.pkl"
-    if os.path.exists(gp_path):
-        print("\nEvaluating SAMO-GP Pareto Front on Test Set...")
-        with open(gp_path, 'rb') as f:
-            gp_data = pickle.load(f)
-        gp_test_front = []
-        for surge_str, subsidy_str in tqdm(gp_data['formulas']):
-            surge_func = toolbox.compile(expr=gp.PrimitiveTree.from_string(surge_str, pset))
-            subsidy_func = toolbox.compile(expr=gp.PrimitiveTree.from_string(subsidy_str, pset))
-            params = {
-                'surge': lambda t, no, nd, sd: np.vectorize(surge_func)(t, no, nd, sd),
-                'subsidy': lambda t, no, nd, sd: np.vectorize(subsidy_func)(t, no, nd, sd)
-            }
-            res = evaluate_policy_on_test_env(sim_path, params)
-            gp_test_front.append(res)
-        test_results['SAMO-GP'] = np.array(gp_test_front)
-
-    # 2. 评估 SAMO-DE 测试集前沿 (逻辑类似，解析固定的 P 向量模板)
-    de_path = f"{save_dir}/samode_results.pkl"
-    if os.path.exists(de_path):
-        print("\nEvaluating SAMO-DE Pareto Front on Test Set...")
-        with open(de_path, 'rb') as f:
-            de_data = pickle.load(f)
-
-        de_test_front = []
-        for p_vector in tqdm(de_data['parameters']):
-            # 闭包绑定 p_vector，避免 lambda 后期求值问题
-            params = {
-                'surge': lambda t, no, nd, sd, p=p_vector: parameterized_surge(t, no, nd, sd, p),
-                'subsidy': lambda t, no, nd, sd, p=p_vector: parameterized_subsidy(t, no, nd, sd, p)
-            }
-            res = evaluate_policy_on_test_env(sim_path, params)
-            de_test_front.append(res)
-        test_results['SAMO-DE'] = np.array(de_test_front)
-
-        # 3. 评估 MARL-PPO 最终策略
-    marl_path = f"{save_dir}/marl_platform_policy.pth"
-    if os.path.exists(marl_path):
-        print("\nEvaluating MARL-PPO on Test Set...")
-        agent = PlatformPPOAgent()
-        agent.load(marl_path)
-        rl_policy = RLPlatformPolicy(agent)
-        params = {'surge': rl_policy.surge, 'subsidy': rl_policy.subsidy}
-
-        # RL 没有前沿，测 10 次作为轨迹散点
-        rl_test_front = []
-        for _ in tqdm(range(10)):
-            rl_test_front.append(evaluate_policy_on_test_env(sim_path, params, num_test_episodes=1))
-        test_results['MARL'] = np.array(rl_test_front)
-
-    # 保存严谨的测试集结果
-    with open(f"{save_dir}/test_pareto_fronts.pkl", 'wb') as f:
-        pickle.dump(test_results, f)
-    print("\nFair test evaluation completed. Saved to test_pareto_fronts.pkl")
+def protected_log(x):
+    safe_x = np.where(np.abs(x) > 1e-6, np.abs(x), 1.0)
+    return np.where(np.abs(x) > 1e-6, np.log(safe_x), 0.0)
 
 
-if __name__ == "__main__":
+# 定义映射字典，将 DEAP 的算子映射为 Python 可执行代码
+GP_CONTEXT = {
+    'add': np.add,
+    'sub': np.subtract,
+    'mul': np.multiply,
+    'protected_div': protected_div,
+    'protected_log': protected_log,
+    'sin': np.sin,
+    'np': np
+}
+
+
+def parse_gp_formula(formula_str):
+    """将 MOGP 保存的字符串公式转化为可执行的 Lambda 函数"""
+
+    def gp_func(t, no, nd, sd):
+        local_vars = {'t': t, 'no': no, 'nd': nd, 'sd': sd}
+        try:
+            # 动态执行公式字符串
+            res = eval(formula_str, GP_CONTEXT, local_vars)
+            if np.isscalar(res) or np.ndim(res) == 0:
+                res = np.full_like(no, float(res))
+            return res
+        except Exception as e:
+            print(f"GP Formula Eval Error: {e}")
+            return np.ones_like(no)
+
+    return gp_func
+
+
+# --- 2. 策略加载工厂 ---
+def load_best_mogp_policy(filepath):
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    # 假设我们挑选利润 (Profit，第0维) 最高的那组策略
+    best_idx = np.argmax([fit[0] for fit in data['pareto_fitness']])
+    best_surge_str, best_subsidy_str = data['formulas'][best_idx]
+
+    print(f"[Loaded MOGP] Surge: {best_surge_str}")
+    print(f"[Loaded MOGP] Subsidy: {best_subsidy_str}")
+
+    return {
+        'surge': parse_gp_formula(best_surge_str),
+        'subsidy': parse_gp_formula(best_subsidy_str)
+    }
+
+
+def load_best_mode_policy(filepath):
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    best_idx = np.argmax([fit[0] for fit in data['pareto_fitness']])
+    best_params = data['parameters'][best_idx]
+
+    print(f"[Loaded MODE] Params: {np.round(best_params, 2)}")
+
+    return {
+        'surge': lambda t, no, nd, sd: parameterized_surge(t, no, nd, sd, best_params),
+        'subsidy': lambda t, no, nd, sd: parameterized_subsidy(t, no, nd, sd, best_params)
+    }
+
+
+def load_rl_policy(filepath):
+    agent = PlatformPPOAgent()
+    agent.load(filepath)
+    rl_policy = RLPlatformPolicy(agent)
+    print(f"[Loaded RL] Model weights loaded from {filepath}")
+    return {
+        'surge': rl_policy.surge,
+        'subsidy': rl_policy.subsidy
+    }
+
+
+# --- 3. 运行评估循环 ---
+def run_evaluation(sim_path, policy_params, algo_name, num_episodes=15):
+    print(f"\n>>> Evaluating {algo_name} Strategy ...")
+    trainer = Trainer(simulator_path=sim_path)
+
+    # 重置底层司机经验，确保公平起跑
+    trainer.reset_to_base_weights()
+    trainer.agent.optimizer.state.clear()
+
+    # 运行多轮以达到下层司机的纳什均衡
+    fitness = trainer.train_and_evaluate(policy_params, num_episodes=num_episodes)
+    return fitness  # 返回 [Profit, -Wait Time, -Gini]
+
+
+# --- 4. 可视化对比 ---
+def plot_comparison(results_dict, save_path="results/algorithm_comparison.png"):
+    algos = list(results_dict.keys())
+    profits = [results_dict[alg][0] for alg in algos]
+    efficiencies = [results_dict[alg][1] for alg in algos]  # Wait Time (负值)
+    fairnesses = [results_dict[alg][2] for alg in algos]  # Gini (负值)
+
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    colors = ['#4C72B0', '#55A868', '#C44E52']
+
+    # Profit (越高越好)
+    axs[0].bar(algos, profits, color=colors)
+    axs[0].set_title('Platform Profit (Higher is better)')
+    axs[0].set_ylabel('Profit')
+
+    # Efficiency (越高越好，因为是负的等待时间)
+    axs[1].bar(algos, efficiencies, color=colors)
+    axs[1].set_title('Efficiency / -Wait Time (Higher is better)')
+
+    # Fairness (越高越好，因为是负的Gini)
+    axs[2].bar(algos, fairnesses, color=colors)
+    axs[2].set_title('Fairness / -Gini (Higher is better)')
+
+    for ax in axs:
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"\n[Done] Comparison plot saved to {save_path}")
+    plt.show()
+
+
+def plot_pareto_fronts(mogp_path, mode_path, rl_scores=None, save_path="results/pareto_comparison_3d.png"):
+    """绘制 MOGP, MODE 的 3D 帕累托前沿，以及 RL 的单点对比"""
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 1. 加载并绘制 MOGP 的帕累托前沿
+    if os.path.exists(mogp_path):
+        with open(mogp_path, 'rb') as f:
+            mogp_data = pickle.load(f)
+            mogp_pf = np.array(mogp_data['pareto_fitness'])
+            ax.scatter(mogp_pf[:, 0], mogp_pf[:, 1], mogp_pf[:, 2],
+                       c='#4C72B0', marker='o', s=60, alpha=0.8, label='MOGP Pareto Front')
+
+    # 2. 加载并绘制 MODE 的帕累托前沿
+    if os.path.exists(mode_path):
+        with open(mode_path, 'rb') as f:
+            mode_data = pickle.load(f)
+            mode_pf = np.array(mode_data['pareto_fitness'])
+            ax.scatter(mode_pf[:, 0], mode_pf[:, 1], mode_pf[:, 2],
+                       c='#55A868', marker='^', s=60, alpha=0.8, label='MODE Pareto Front')
+
+    # 3. 绘制 RL 的最终表现点
+    if rl_scores is not None:
+        ax.scatter(rl_scores[0], rl_scores[1], rl_scores[2],
+                   c='#C44E52', marker='*', s=300, edgecolors='black', label='RL Policy')
+
+    ax.set_xlabel('Profit (Higher is Better)')
+    ax.set_ylabel('Efficiency / -Wait Time')
+    ax.set_zlabel('Fairness / -Gini')
+    ax.set_title('3D Pareto Front Comparison')
+    ax.legend()
+
+    # 调整视角以便更好地观察 Profit 轴
+    ax.view_init(elev=20, azim=45)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"\n[Done] 3D Pareto Front plot saved to {save_path}")
+    plt.show()
+
+
+if __name__ == '__main__':
     sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
-    test_results=pickle.load(open('results/test_pareto_fronts.pkl', 'rb'))
-    pass
-    # run_fair_benchmark(sim_path)
+
+    if not os.path.exists(sim_path):
+        print("Simulator not found. Please check the path.")
+    else:
+        # 定义保存的策略文件路径
+        mogp_path = "results/samogp_results.pkl"
+        mode_path = "results/samode_results.pkl"
+        rl_path = "results/marl_platform_policy.pth"
+
+        # 存放最终的跑分结果
+        final_scores = {}
+
+        # 测试参数：建议设为 15 轮，给底层司机足够的收敛时间适应策略
+        EVAL_EPISODES = 15
+
+        # 1. 测试 MOGP
+        if os.path.exists(mogp_path):
+            mogp_policy = load_best_mogp_policy(mogp_path)
+            final_scores['MOGP'] = run_evaluation(sim_path, mogp_policy, 'MOGP', EVAL_EPISODES)
+        else:
+            print("MOGP results not found.")
+
+        # 2. 测试 MODE
+        if os.path.exists(mode_path):
+            mode_policy = load_best_mode_policy(mode_path)
+            final_scores['MODE'] = run_evaluation(sim_path, mode_policy, 'MODE', EVAL_EPISODES)
+        else:
+            print("MODE results not found.")
+
+        # 3. 测试 RL
+        if os.path.exists(rl_path):
+            rl_policy = load_rl_policy(rl_path)
+            final_scores['RL'] = run_evaluation(sim_path, rl_policy, 'RL', EVAL_EPISODES)
+        else:
+            print("RL results not found.")
+
+        # 4. 绘制并输出对比结果
+        if final_scores:
+            print("\n=== Final Benchmark Results ===")
+            for alg, scores in final_scores.items():
+                print(f"{alg:>5} -> Profit: {scores[0]:.2f} | Efficiency: {scores[1]:.2f} | Fairness: {scores[2]:.4f}")
+            plot_comparison(final_scores)
+
+        plot_pareto_fronts(mogp_path, mode_path, final_scores.get('RL'))

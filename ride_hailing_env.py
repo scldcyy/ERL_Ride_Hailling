@@ -85,7 +85,7 @@ class RideHailingEnv:
         hex_latlng = {h: h3.cell_to_latlng(h) for h in self.all_hexes}  # (lat, lng)
 
         for i in range(CONFIG['N_DRIVERS']):
-            if not self.driver_online[i]:
+            if not self.driver_online[i] or self.driver_status[i] != 0:
                 states[i] = np.zeros(CONFIG['STATE_DIM'])
                 continue
 
@@ -263,10 +263,12 @@ class RideHailingEnv:
                     self.driver_locations[i] = order['dest_idx']
                     self.driver_daily_income[i] += actual_income
                     step_revenue += price  # 平台原始收入（未扣补贴）
-
                 else:
-                    # 无订单可接：空闲奖励
                     rewards[i] = CONFIG['IDLE_REWARD']
+
+            elif action == 1:  # 原地等待 (a_stay)
+                rewards[i] = CONFIG['IDLE_REWARD']
+
             else:  # 重定位
                 target_direct = action - 2
                 neighbors = self.adjacency_indices.get(current_loc, {})
@@ -305,22 +307,31 @@ class RideHailingEnv:
         """更新司机上下线状态：兼职司机达到收入目标下线，低收益时司机不上线"""
         for i in range(CONFIG['N_DRIVERS']):
             if not self.driver_online[i]:
-                # 已下线司机：判断是否重新上线（预期收益>阈值）
+                # 已下线司机：判断是否重新上线
                 if self.driver_type[i] == 0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']:
                     continue
                 loc = self.driver_locations[i]
                 cur_surge = surge[loc]
                 cur_subsidy = subsidy[loc]
-                # 简单预期收益：当前区域订单密度*单位收益
-                order_density = len([o for o in self.pending_orders if o['origin_idx'] == loc]) / self.n_zones
-                expected_income = order_density * (cur_surge * CONFIG['BASE_FARE'] + cur_subsidy)
+
+                # [核心修复]：改为计算网格局部的供需比例，得出真实的抢单概率
+                local_orders = len([o for o in self.pending_orders if o['origin_idx'] == loc])
+                local_idle_drivers = np.sum(
+                    (self.driver_locations == loc) & (self.driver_status == 0) & self.driver_online)
+
+                # 抢单概率最高为 1.0 (订单多于司机时，必定能抢到)
+                order_probability = min(1.0, local_orders / (local_idle_drivers + 1e-6))
+
+                # 预期收益 = 抢到单的概率 * 这一单的基础价值
+                expected_income = order_probability * (cur_surge * CONFIG['BASE_FARE'] + cur_subsidy)
+
                 if expected_income > DRIVER_CONFIG['ONLINE_THRESHOLD']:
                     self.driver_online[i] = True
                 continue
 
             # 在线司机：兼职司机达到收入目标则下线
             if self.driver_type[i] == 0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']:
-                # Ensure driver is not currently serving a trip ---
+                # 确保司机当前没有在运送乘客
                 if self.driver_free_time[i] == 0:
                     self.driver_online[i] = False
                     self.driver_status[i] = 0  # 强制设为空闲
