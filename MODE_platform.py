@@ -256,7 +256,7 @@ def plot_and_save_results(hof, history, save_dir="results"):
     ax.set_title('SAMO-GP Pareto Front')
     fig.colorbar(sc, ax=ax, label='Profit')
 
-    plt.savefig(f"{save_dir}/samogp_pareto_3d.png")
+    plt.savefig(f"{save_dir}/samode_pareto_3d.png")
     plt.show()
 
     # --- 保存结果用于 Baseline 对比 ---

@@ -56,6 +56,15 @@ class PlatformPPOAgent:
 
         self.states, self.actions, self.logprobs, self.rewards = [], [], [], []
 
+    def predict(self, states):
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(states)
+            action_mean = self.policy.actor(states_tensor)  # 确定性输出
+            actions_np = action_mean.numpy()
+            surge = np.clip(actions_np[:, 0] * 2.0 + 3.0, CONFIG['MIN_SURGE'], CONFIG['MAX_SURGE'])
+            subsidy = np.clip(actions_np[:, 1] * 10.0 + 10.0, CONFIG['MIN_SUBSIDY'], CONFIG['MAX_SUBSIDY'])
+            return surge, subsidy
+
     def select_actions(self, states):
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states)
@@ -119,9 +128,10 @@ class PlatformPPOAgent:
 
 # --- 2. 桥接机制：附带偏好权重的策略闭包 ---
 class RLPlatformPolicy:
-    def __init__(self, agent, pref_weights):
+    def __init__(self, agent, pref_weights, is_eval=False):
         self.agent = agent
-        self.weights = pref_weights  # [w_profit, w_efficiency, w_fairness]
+        self.weights = pref_weights     # [w_profit, w_efficiency, w_fairness]
+        self.is_eval = is_eval
         self.current_surge = None
         self.current_subsidy = None
         self.last_t = -1
@@ -131,15 +141,16 @@ class RLPlatformPolicy:
         if t != self.last_t:
             n_zones = len(no)
             t_array = np.full(n_zones, t)
-
-            w1 = np.full(n_zones, self.weights[0])
-            w2 = np.full(n_zones, self.weights[1])
-            w3 = np.full(n_zones, self.weights[2])
-
-            # 状态拼接：原有 4 维 + 偏好 3 维 = 7 维
+            w1, w2, w3 = np.full(n_zones, self.weights[0]), np.full(n_zones, self.weights[1]), np.full(n_zones,
+                                                                                                       self.weights[2])
             states = np.stack([t_array, no / 50.0, nd / 50.0, sd, w1, w2, w3], axis=-1)
 
-            self.current_surge, self.current_subsidy = self.agent.select_actions(states)
+            # 根据模式选择方法
+            if self.is_eval:
+                self.current_surge, self.current_subsidy = self.agent.predict(states)
+            else:
+                self.current_surge, self.current_subsidy = self.agent.select_actions(states)
+
             self.last_t = t
             self.current_no = no
 
@@ -183,7 +194,7 @@ def train_morl(sim_path, num_episodes=200):
             unfulfilled_penalty = rl_policy.current_no * -0.5 if rl_policy.current_no is not None else np.zeros(277)
 
             # 2. 根据当前的偏好权重进行动态标量化！
-            r_profit = zone_profits / 100.0
+            r_profit = zone_profits
             r_efficiency = unfulfilled_penalty
 
             local_step_reward = (pref_weights[0] * r_profit + pref_weights[1] * r_efficiency)
@@ -195,13 +206,14 @@ def train_morl(sim_path, num_episodes=200):
                 wait_time = -info['total_wait_time']
 
                 # 公平性主要在回合结束体现
-                terminal_gini_penalty = -gini_index * 20.0
+                terminal_gini_penalty = -gini_index * 1000.0
                 platform_agent.rewards[-1] += pref_weights[2] * terminal_gini_penalty
 
                 # 记录真实评估指标
                 history_profit.append(ep_total_profit)
                 history_efficiency.append(wait_time)
                 history_fairness.append(-gini_index)
+                print(f"Episode {ep} | Profit: {ep_total_profit:.2f} | Wait Time: {wait_time:.2f} | Gini: {gini_index:.2f}")
                 break
 
         trainer.agent.update()

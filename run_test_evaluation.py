@@ -1,13 +1,11 @@
 import os
 import pickle
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# 导入你的底层环境和 RL 策略网络
 from shared_ppo import Trainer
-from RL_platform import PlatformPPOAgent, RLPlatformPolicy
+from MORL_platform import PlatformPPOAgent, RLPlatformPolicy, extract_pareto_front
 from MODE_platform import parameterized_surge, parameterized_subsidy
 
 
@@ -53,6 +51,77 @@ def parse_gp_formula(formula_str):
     return gp_func
 
 
+def reevaluate_policies(sim_path, policies, algo_name, num_episodes=15):
+    """在一个干净的环境中重新评估策略集合，提取真正的测试集帕累托前沿"""
+    print(f"\n>>> Re-evaluating {algo_name} test performance ({len(policies)} policies)...")
+    trainer = Trainer(simulator_path=sim_path)
+    test_fitnesses = []
+
+    for policy in tqdm(policies, desc=f"Eval {algo_name}"):
+        trainer.reset_to_base_weights()
+        trainer.agent.optimizer.state.clear()
+
+        # 运行测试回合，取最后几轮的平稳均值
+        fitness = trainer.train_and_evaluate(policy, num_episodes=num_episodes)
+        test_fitnesses.append(fitness[:3])
+
+    test_fitnesses = np.array(test_fitnesses)
+    # 提取测试集上的帕累托前沿
+    test_pf, _ = extract_pareto_front(test_fitnesses, policies)
+    print(f"[{algo_name}] Retained {len(test_pf)} Pareto optimal points on test set.")
+    return test_pf
+
+
+def load_and_prepare_mogp(filepath):
+    with open(filepath, 'rb') as f: data = pickle.load(f)
+    return [{'surge': parse_gp_formula(s), 'subsidy': parse_gp_formula(sub)} for s, sub in data['formulas']]
+
+
+def load_and_prepare_mode(filepath):
+    with open(filepath, 'rb') as f: data = pickle.load(f)
+    return [{'surge': lambda t, no, nd, sd, p=p: parameterized_surge(t, no, nd, sd, p),
+             'subsidy': lambda t, no, nd, sd, p=p: parameterized_subsidy(t, no, nd, sd, p)} for p in data['parameters']]
+
+
+def load_and_prepare_rl(filepath):
+    agent = PlatformPPOAgent()
+    agent.load(filepath)
+    # 生成均匀分布的测试偏好
+    test_weights = [
+        [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+        [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
+        [0.33, 0.33, 0.34], [0.7, 0.15, 0.15], [0.15, 0.7, 0.15], [0.15, 0.15, 0.7]
+    ]
+    policies = []
+    for w in test_weights:
+        rl_policy = RLPlatformPolicy(agent, w, is_eval=True)  # 启用 eval 模式
+        policies.append({'surge': rl_policy.surge, 'subsidy': rl_policy.subsidy})
+    return policies
+
+
+def plot_test_pareto_fronts(pf_dict, save_path="results/test_pareto_comparison.png"):
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    colors = {'MOGP': '#4C72B0', 'MODE': '#55A868', 'RL': '#C44E52'}
+    markers = {'MOGP': 'o', 'MODE': '^', 'RL': '*'}
+    sizes = {'MOGP': 60, 'MODE': 60, 'RL': 200}
+
+    for algo, pf in pf_dict.items():
+        if len(pf) > 0:
+            ax.scatter(pf[:, 0], pf[:, 1], pf[:, 2],
+                       c=colors[algo], marker=markers[algo], s=sizes[algo], alpha=0.8, label=algo)
+
+    ax.set_xlabel('Profit')
+    ax.set_ylabel('Efficiency / -Wait Time')
+    ax.set_zlabel('Fairness / -Gini')
+    ax.set_title('True Test Set 3D Pareto Front')
+    ax.legend()
+    ax.view_init(elev=20, azim=45)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.show()
+
 # --- 2. 策略加载工厂 ---
 def load_best_mogp_policy(filepath):
     with open(filepath, 'rb') as f:
@@ -87,7 +156,8 @@ def load_best_mode_policy(filepath):
 def load_rl_policy(filepath):
     agent = PlatformPPOAgent()
     agent.load(filepath)
-    rl_policy = RLPlatformPolicy(agent)
+    pref_weights = np.random.dirichlet(np.ones(3))
+    rl_policy = RLPlatformPolicy(agent,pref_weights)
     print(f"[Loaded RL] Model weights loaded from {filepath}")
     return {
         'surge': rl_policy.surge,
@@ -184,47 +254,23 @@ def plot_pareto_fronts(mogp_path, mode_path, rl_scores=None, save_path="results/
 
 if __name__ == '__main__':
     sim_path = 'model/generators/simulator_hex_scaling=0.004257843312339327_weekday.pkl'
+    EVAL_EPISODES = 15
+    test_fronts = {}
 
-    if not os.path.exists(sim_path):
-        print("Simulator not found. Please check the path.")
-    else:
-        # 定义保存的策略文件路径
-        mogp_path = "results/samogp_results.pkl"
-        mode_path = "results/samode_results.pkl"
-        rl_path = "results/marl_platform_policy.pth"
+    if os.path.exists("results/samogp_results.pkl"):
+        policies = load_and_prepare_mogp("results/samogp_results.pkl")
+        test_fronts['MOGP'] = reevaluate_policies(sim_path, policies, 'MOGP', EVAL_EPISODES)
 
-        # 存放最终的跑分结果
-        final_scores = {}
+    if os.path.exists("results/samode_results.pkl"):
+        policies = load_and_prepare_mode("results/samode_results.pkl")
+        test_fronts['MODE'] = reevaluate_policies(sim_path, policies, 'MODE', EVAL_EPISODES)
 
-        # 测试参数：建议设为 15 轮，给底层司机足够的收敛时间适应策略
-        EVAL_EPISODES = 15
+    if os.path.exists("results/morl_platform_policy.pth"):
+        policies = load_and_prepare_rl("results/morl_platform_policy111.pth")
+        test_fronts['RL'] = reevaluate_policies(sim_path, policies, 'RL', EVAL_EPISODES)
 
-        # 1. 测试 MOGP
-        if os.path.exists(mogp_path):
-            mogp_policy = load_best_mogp_policy(mogp_path)
-            final_scores['MOGP'] = run_evaluation(sim_path, mogp_policy, 'MOGP', EVAL_EPISODES)
-        else:
-            print("MOGP results not found.")
+    if test_fronts:
+        plot_test_pareto_fronts(test_fronts)
 
-        # 2. 测试 MODE
-        if os.path.exists(mode_path):
-            mode_policy = load_best_mode_policy(mode_path)
-            final_scores['MODE'] = run_evaluation(sim_path, mode_policy, 'MODE', EVAL_EPISODES)
-        else:
-            print("MODE results not found.")
-
-        # 3. 测试 RL
-        if os.path.exists(rl_path):
-            rl_policy = load_rl_policy(rl_path)
-            final_scores['RL'] = run_evaluation(sim_path, rl_policy, 'RL', EVAL_EPISODES)
-        else:
-            print("RL results not found.")
-
-        # 4. 绘制并输出对比结果
-        if final_scores:
-            print("\n=== Final Benchmark Results ===")
-            for alg, scores in final_scores.items():
-                print(f"{alg:>5} -> Profit: {scores[0]:.2f} | Efficiency: {scores[1]:.2f} | Fairness: {scores[2]:.4f}")
-            plot_comparison(final_scores)
-
-        plot_pareto_fronts(mogp_path, mode_path, final_scores.get('RL'))
+    with open("results/test_pareto_fronts111.pkl", "wb") as f:
+        pickle.dump(test_fronts, f)

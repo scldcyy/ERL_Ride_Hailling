@@ -1,8 +1,9 @@
 CONFIG = {
-    'N_DRIVERS': 200,
+    'N_DRIVERS': 400,
     'TIME_STEP_MINUTES': 5,
     'TIME_STEPS_PER_DAY': 288,
     'N_ZONES': 277,
+    'TRIPS_PER_DRIVER_DAY': 25,
 
     # PPO Hyperparameters
     'HIDDEN_DIM': 256,
@@ -29,6 +30,9 @@ CONFIG = {
     'MAX_SURGE': 5.0,
     'MIN_SUBSIDY': 0.0,
     'MAX_SUBSIDY': 20.0,
+
+    # 保存路径相关
+    'GENETATE_SAVE_DIR': 'generator',
 }
 
 # --- 新增：司机异质性配置 --
