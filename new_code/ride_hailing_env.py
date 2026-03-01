@@ -164,6 +164,7 @@ class RideHailingEnv:
         ])
         return obs
 
+
     def step(self, actions, platform_params):
         # 解析platform_params=(λ，subsidy, η)
         surge,subsidy=self.compile(platform_params)
@@ -282,6 +283,8 @@ class RideHailingEnv:
 
         self.time += 1
         done = (self.time >= CONFIG['TIME_STEPS_PER_DAY'])
+
+        surge, subsidy = self.compile(platform_params)
         next_state = self._get_state(surge,subsidy)
 
         info = {
@@ -324,7 +327,8 @@ class RideHailingEnv:
                 continue
 
             # 在线司机：兼职司机达到收入目标则下线
-            if self.driver_status[i] == 0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']:
+            if (self.driver_status[i] == 0 and self.driver_type[i] ==
+                    0 and self.driver_daily_income[i] >= DRIVER_CONFIG['PART_TIME_INCOME_TARGET']):
                 self.driver_status[i] = 2  # 强制设为空闲
                 self.driver_free_time[i] = 0
 

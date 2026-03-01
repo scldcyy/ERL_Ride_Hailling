@@ -102,9 +102,6 @@ class SharedPPOAgent:
 
         T, N, _ = old_states.shape
 
-        # If the sum of absolute values in a state is > 0, the driver is online.
-        active_masks = (torch.abs(old_states).sum(dim=2) > 1e-6).float()
-
         with torch.no_grad():
             flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
             values = self.policy_old.critic(flat_states).view(T, N)
@@ -114,32 +111,22 @@ class SharedPPOAgent:
 
         for t in reversed(range(T)):
             if t == T - 1:
-                next_non_terminal = torch.zeros(N)
                 next_value = torch.zeros(N)
             else:
-                next_non_terminal = active_masks[t + 1]
                 next_value = values[t + 1]
             # Calculate TD error
-            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            delta = rewards[t] + self.gamma * next_value - values[t]
 
-            # Apply the mask to break the MDP chain for offline drivers ---
-            delta = delta * active_masks[t]
-            last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
-
-            #Mask last_gae_lam to prevent advantage bleed ---
-            last_gae_lam = last_gae_lam * active_masks[t]
+            last_gae_lam = delta + self.gamma * self.gae_lambda * last_gae_lam
             advantages[t] = last_gae_lam
 
         returns = advantages + values
 
-        # Filter out offline experiences before training ---
-        flat_masks = active_masks.view(-1).bool()
-
-        flat_states = old_states.view(-1, CONFIG['STATE_DIM'])[flat_masks]
-        flat_actions = old_actions.view(-1)[flat_masks]
-        flat_logprobs = old_logprobs.view(-1)[flat_masks]
-        flat_advantages = advantages.view(-1)[flat_masks]
-        flat_returns = returns.view(-1)[flat_masks]
+        flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
+        flat_actions = old_actions.view(-1)
+        flat_logprobs = old_logprobs.view(-1)
+        flat_advantages = advantages.view(-1)
+        flat_returns = returns.view(-1)
 
         # Only standardize advantages if we have active samples
         if flat_advantages.shape[0] > 1:
@@ -276,7 +263,7 @@ class Trainer:
             ax.grid(True, alpha=0.3)
             ax.set_xlabel('Episode')
             ax.set_ylabel(title)
-        plt.savefig(f"{title}_rewards.png")
+        plt.savefig(f"kpi_curve.png")
         plt.close()  # 释放内存
 
 
