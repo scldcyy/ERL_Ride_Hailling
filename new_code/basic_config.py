@@ -1,5 +1,5 @@
 CONFIG = {
-    'N_DRIVERS': 400,
+    'N_DRIVERS': 500,
     'TIME_STEP_MINUTES': 5,
     'TIME_STEPS_PER_DAY': 288,
     'N_ZONES': 277,
@@ -7,7 +7,7 @@ CONFIG = {
 
     # PPO Hyperparameters
     'HIDDEN_DIM': 256,
-    'STATE_DIM': 12,  # [Lat, Lng, t, Orders, Drivers, AvgOrders, AvgDrivers, FreeTime, Surge, Subsidy, DriverType, IncomeProgress]
+    'STATE_DIM': 45,  # # 状态维度预估: 中心点(6) + 6邻居(6*6) + 司机属性(3) = 45维。 特征: [lat, lng, orders, drivers, surge, subsidy]
     'ACTION_DIM': 8,
     'LR_ACTOR': 3e-4,
     'LR_CRITIC': 1e-3,
