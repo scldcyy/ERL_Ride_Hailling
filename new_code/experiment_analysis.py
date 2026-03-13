@@ -56,7 +56,6 @@ def run_comparison_experiment(simulator_path, model_path='ppo_agent_final.pth'):
         # 3. 初始化 Agent 并加载权重
         agent = SharedPPOAgent(CONFIG['STATE_DIM'], CONFIG['ACTION_DIM'], **CONFIG)
         if model_exists:
-            # map_location='cpu' 确保在只有 CPU 的机器上也能跑
             agent.policy.load_state_dict(torch.load(model_path))
             agent.policy.eval()  # 切换到评估模式
 

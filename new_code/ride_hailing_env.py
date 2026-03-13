@@ -107,7 +107,7 @@ class RideHailingEnv:
             surge / 5.0,
             subsidy / 20.0
         ])
-        self.cached_grid_features = grid_features  # <--- 新增这行，缓存供 Critic 查询
+        self.cached_grid_features = grid_features  # <--- 缓存供 Critic 查询
         dummy_feature = np.full(6, -1.0)
 
         for i in range(CONFIG['N_DRIVERS']):
@@ -135,7 +135,6 @@ class RideHailingEnv:
             # --- 动作掩码计算 ---
             action_masks[i, 1] = True  # 永远可以原地等待
 
-            # 【修复核心 2】：删掉 if order_counts > 0 的判断。
             # 必须永远允许输出动作 0，以接住 step 内部刚刚刷新的新订单！
             action_masks[i, 0] = True
 
@@ -178,11 +177,6 @@ class RideHailingEnv:
         zone_profits = np.zeros(self.n_zones)
 
         self._update_driver_online_status(surge, subsidy)
-
-        self.driver_free_time[self.driver_free_time > 0] -= 1
-        freed_drivers = np.where((self.driver_status == 1) & (self.driver_free_time == 0))[0]
-        self.driver_status[freed_drivers] = 0
-        self.driver_active_steps[self.driver_status == 1] += 1
 
         raw_orders = self.simulator.get_fixed_orders(self.time)
         self.total_generated_orders += len(raw_orders)
@@ -327,12 +321,21 @@ class RideHailingEnv:
         self.time += 1
         done = (self.time >= CONFIG['TIME_STEPS_PER_DAY'])
 
+        # ---------------- 核心修复：状态流转后移 ----------------
+        # 让倒计时在一切结算完后再流逝，确保被释放的司机能在下一次观测中拿到正确的动作掩码
+        self.driver_free_time[self.driver_free_time > 0] -= 1
+        freed_drivers = np.where((self.driver_status == 1) & (self.driver_free_time == 0))[0]
+        self.driver_status[freed_drivers] = 0
+
+        # 统计在场活跃（非离线）的步数
+        self.driver_active_steps[self.driver_status != 2] += 1
+        # -------------------------------------------------------------
+
         surge, subsidy = self.compile(platform_params)
+        # 现在，刚刚 free 的司机能被正确捕捉，分配允许接单的掩码
         next_state, next_mask = self._get_state_and_mask(surge, subsidy)
 
-        # --- 核心修复：清理已匹配的订单，防止历史脏数据无限堆积拖慢向量化运算 ---
         self.pending_orders = [o for o in self.pending_orders if not o['matched']]
-        step_profit = step_revenue * commission - step_subsidy_cost
 
         info = {
             'step_profit': step_profit,

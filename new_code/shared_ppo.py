@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
 from torch.distributions import Categorical
-from torch.utils.data import BatchSampler
 from tqdm import tqdm
 from basic_config import CONFIG
 from ride_hailing_env import RideHailingEnv
 from generate_simulator import PassengerSimulator
+
 sys.path.append(os.getcwd())
 
 
@@ -33,11 +33,8 @@ class ActorCritic(nn.Module):
                 nn.init.constant_(m.bias, 0.0)
 
     def act(self, state, action_mask):
-        """注入动作掩码：极大负值屏蔽非法动作"""
         action_logits = self.actor(state)
-        # 将 mask 为 False 的位置填充为极小值
-        action_logits = action_logits.masked_fill(~action_mask, -1e9)  # 直接使用传入的 Tensor
-
+        action_logits = action_logits.masked_fill(~action_mask, -1e9)
         dist = Categorical(logits=action_logits)
         action = dist.sample()
         action_logprob = dist.log_prob(action)
@@ -47,7 +44,6 @@ class ActorCritic(nn.Module):
         action_logits = self.actor(state)
         action_logits = action_logits.masked_fill(~action_mask, -1e9)
         dist = Categorical(logits=action_logits)
-
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
         state_values = self.critic(state)
@@ -61,8 +57,8 @@ class RolloutBuffer:
         self.logprobs = []
         self.rewards = []
         self.dones = []
-        self.masks = []  # 记录环境提供的动作掩码
-        self.active_flags = []  # 记录司机是否有效 (状态非忙碌且非离线)
+        self.masks = []
+        self.active_flags = []
 
     def clear(self):
         self.states.clear()
@@ -85,7 +81,6 @@ class SharedPPOAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.buffer = RolloutBuffer()
 
-        # 核心改造 3.2: 引入 Huber Loss 防止大额订单带来梯度爆炸
         self.ValueLoss = nn.SmoothL1Loss()
 
         self.gamma = hyperparameters['GAMMA']
@@ -99,13 +94,13 @@ class SharedPPOAgent:
     def select_actions(self, states, action_masks):
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states)
-            masks_tensor = torch.BoolTensor(action_masks) # 提前转换
+            masks_tensor = torch.BoolTensor(action_masks)
             actions, logprobs = self.policy_old.act(states_tensor, masks_tensor)
 
         self.buffer.states.append(states_tensor)
         self.buffer.actions.append(actions)
         self.buffer.logprobs.append(logprobs)
-        self.buffer.masks.append(masks_tensor) # 直接存 Tensor
+        self.buffer.masks.append(masks_tensor)
         return actions.numpy()
 
     def update(self):
@@ -114,7 +109,7 @@ class SharedPPOAgent:
         old_states = torch.stack(self.buffer.states)
         old_actions = torch.stack(self.buffer.actions)
         old_logprobs = torch.stack(self.buffer.logprobs)
-        old_masks = torch.stack(self.buffer.masks) # 修复报错的关键：保持为 Tensor
+        old_masks = torch.stack(self.buffer.masks)
 
         rewards = torch.tensor(np.array(self.buffer.rewards), dtype=torch.float32)
         active_flags = torch.tensor(np.array(self.buffer.active_flags), dtype=torch.float32)
@@ -123,86 +118,95 @@ class SharedPPOAgent:
 
         with torch.no_grad():
             flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
+            # 先计算所有的 Value，后续我们只提取 Active 的部分
             values = self.policy_old.critic(flat_states).view(T, N)
 
         advantages = torch.zeros_like(rewards)
-        last_gae_lam = torch.zeros(N)
+        returns = torch.zeros_like(rewards)
 
-        # 核心修复：移除 next_active 的强行截断，保留标准 MDP 的价值传导
-        for t in reversed(range(T)):
-            if t == T - 1:
-                next_value = torch.zeros(N)
-            else:
-                next_value = values[t + 1]
+        # ---------------- 核心修复：基于 SMDP 的按司机轨迹重构与时间跳跃折现 ----------------
+        for i in range(N):
+            # 提取当前司机所有有决策权（Active）的时间步索引
+            active_steps = torch.nonzero(active_flags[:, i]).squeeze(-1).tolist()
+            if isinstance(active_steps, int):
+                active_steps = [active_steps]
+            if not active_steps:
+                continue
 
-            # 此时 next_value 代表时间自然流逝后的价值评估。
-            # 无论司机此时是否 active，他接单时的决策价值都应包含通往目的地的长线收益。
-            delta = rewards[t] + self.gamma * next_value - values[t]
-            last_gae_lam = delta + self.gamma * self.gae_lambda * last_gae_lam
-            advantages[t] = last_gae_lam
+            last_gae_lam = 0.0
+            # 仅在有效的决策点之间进行反向遍历回溯
+            for k in reversed(range(len(active_steps))):
+                curr_t = active_steps[k]
 
-        returns = advantages + values
+                if k == len(active_steps) - 1:
+                    next_value = 0.0
+                    delta_t = 1
+                else:
+                    next_t = active_steps[k + 1]
+                    next_value = values[next_t, i]
+                    # 计算两个决策点之间跨越了多少个环境时间步
+                    delta_t = next_t - curr_t
 
-        # 数据展平
-        flat_states = old_states.view(-1, CONFIG['STATE_DIM'])
-        flat_actions = old_actions.view(-1)
-        flat_logprobs = old_logprobs.view(-1)
-        flat_advantages = advantages.view(-1)
-        flat_returns = returns.view(-1)
-        flat_masks = old_masks.reshape(-1, CONFIG['ACTION_DIM'])
+                # SMDP 的折现公式：gamma 需要根据跨越的时间步数进行指数级衰减
+                gamma_smdp = self.gamma ** delta_t
+
+                # 计算 TD 误差。此时的 rewards[curr_t, i] 正好包含了在 curr_t 做决策后拿到的所有收益（行程总费用）
+                delta = rewards[curr_t, i] + gamma_smdp * next_value - values[curr_t, i]
+
+                last_gae_lam = delta + gamma_smdp * self.gae_lambda * last_gae_lam
+                advantages[curr_t, i] = last_gae_lam
+                returns[curr_t, i] = advantages[curr_t, i] + values[curr_t, i]
+        # -------------------------------------------------------------------------
+
+        # 展平所有数据
         flat_active = active_flags.view(-1).bool()
 
-        # 仅对 Active（在场做决策）的样本标准化与训练，避免脏数据污染
-        active_adv = flat_advantages[flat_active]
-        if active_adv.shape[0] > 1:
-            mean_adv = active_adv.mean()
-            std_adv = active_adv.std() + 1e-7
-            flat_advantages[flat_active] = (active_adv - mean_adv) / std_adv
+        # ---------------- 过滤脏数据：Actor 和 Critic 都只看 Active 的状态 ----------------
+        active_states = old_states.view(-1, CONFIG['STATE_DIM'])[flat_active]
+        active_actions = old_actions.view(-1)[flat_active]
+        active_logprobs = old_logprobs.view(-1)[flat_active]
+        active_advantages = advantages.view(-1)[flat_active]
+        active_returns = returns.view(-1)[flat_active]
+        active_masks = old_masks.view(-1, CONFIG['ACTION_DIM'])[flat_active]
 
-        # 动态衰减探索因子，保证后期收敛平滑
-        self.entropy_coef = max(0.001, self.entropy_coef * 0.99)
-
-        # 1. 找到所有有效的 (t, n) 索引
-        valid_indices = torch.nonzero(flat_active).squeeze()
-        if valid_indices.numel() == 0:
+        if active_states.shape[0] == 0:
             self.buffer.clear()
             return
 
+        # 优势值标准化 (仅基于有效数据)
+        if active_advantages.shape[0] > 1:
+            mean_adv = active_advantages.mean()
+            std_adv = active_advantages.std() + 1e-7
+            active_advantages = (active_advantages - mean_adv) / std_adv
+
+        self.entropy_coef = max(0.001, self.entropy_coef * 0.99)
+        dataset_size = active_states.shape[0]
+        indices = np.arange(dataset_size)
+
         for _ in range(self.ppo_epochs):
-            # 核心改造 3.3: 保证同司机序列采样的相对连续性
-            grouped_indices = []
-            for i in range(N):
-                # 获取司机 i 在所有时间步的有效索引
-                driver_valid_steps = torch.nonzero(active_flags[:, i]).squeeze(-1)
-                if driver_valid_steps.numel() > 0:
-                    flat_idxs = (driver_valid_steps * N + i).tolist()
-                    if isinstance(flat_idxs, list):
-                        grouped_indices.extend(flat_idxs)
-                    else:
-                        grouped_indices.append(flat_idxs)
+            # 在 SMDP 重构且截断了时序污染后，我们可以安全地打乱 batch
+            np.random.shuffle(indices)
 
-            # 按 Batch Size 顺序切分，最大程度保留时间步依赖
-            for i in range(0, len(grouped_indices), self.batch_size):
-                batch_idx = grouped_indices[i:i + self.batch_size]
-                if len(batch_idx) < 2: continue
+            for start_idx in range(0, dataset_size, self.batch_size):
+                end_idx = start_idx + self.batch_size
+                mb_idx = indices[start_idx:end_idx]
 
-                mb_states = flat_states[batch_idx]
-                mb_actions = flat_actions[batch_idx]
-                mb_old_logprobs = flat_logprobs[batch_idx]
-                mb_advantages = flat_advantages[batch_idx]
-                mb_returns = flat_returns[batch_idx]
-                mb_masks = flat_masks[batch_idx]
+                mb_states = active_states[mb_idx]
+                mb_actions = active_actions[mb_idx]
+                mb_old_logprobs = active_logprobs[mb_idx]
+                mb_advantages = active_advantages[mb_idx]
+                mb_returns = active_returns[mb_idx]
+                mb_masks = active_masks[mb_idx]
 
                 logprobs, state_values, dist_entropy = self.policy.evaluate(mb_states, mb_actions, mb_masks)
-                state_values = state_values.squeeze()
+                state_values = state_values.squeeze(-1)
 
                 ratios = torch.exp(logprobs - mb_old_logprobs)
                 surr1 = ratios * mb_advantages
-
-                # 动态自适应 Clip，受 KL 散度约束的思想
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * mb_advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
+                # Critic 现在的 Loss 也是百分百纯净的，不再拟合包含 0 奖励的忙碌期
                 critic_loss = 0.5 * self.ValueLoss(state_values, mb_returns)
 
                 loss = actor_loss + critic_loss - self.entropy_coef * dist_entropy.mean()
@@ -236,7 +240,13 @@ class Trainer:
         self.base_policy_state = copy.deepcopy(self.agent.policy.state_dict())
         self.base_policy_old_state = copy.deepcopy(self.agent.policy_old.state_dict())
 
-    def train_and_evaluate(self, platform_params, num_episodes=5):
+    def reset_to_base_weights(self):
+        """重置底层 PPO 代理的权重，并清空经验池，避免历史污染"""
+        self.agent.policy.load_state_dict(self.base_policy_state)
+        self.agent.policy_old.load_state_dict(self.base_policy_old_state)
+        self.agent.buffer.clear()
+
+    def train_and_evaluate(self, platform_params, num_episodes=5,show_fig=False):
         ep_profits = []
         ep_completion_rates = []
         ep_wait_times = []
@@ -247,32 +257,22 @@ class Trainer:
             ep_total_profit = 0
 
             while True:
-                # 【修复核心 1】：在执行环境 step 之前，记录当前时刻司机是否真正空闲(有决策权)
                 current_active_flags = (self.env.driver_status == 0)
-
                 actions = self.agent.select_actions(state, action_mask)
 
-                # ---------------- 替换原有的 critic_estimator ----------------
                 def critic_estimator_batch(d_ids, dest_idxs):
-                    """批量计算一组司机和目标地点的未来预估价值"""
                     if not d_ids: return np.array([])
-                    # 批量获取伪状态
                     proxy_states = [self.env.get_proxy_state(d, dest) for d, dest in zip(d_ids, dest_idxs)]
                     state_tensor = torch.FloatTensor(np.array(proxy_states))
                     with torch.no_grad():
-                        # 一次性完成前向传播，并转回 numpy 数组
                         return self.agent.policy_old.critic(state_tensor).squeeze(-1).numpy()
-
-                # -------------------------------------------------------------
 
                 next_state, rewards, done, info = self.env.step(
                     actions, platform_params,
-                    value_estimator=critic_estimator_batch  # 传入新的批量预估器
+                    value_estimator=critic_estimator_batch
                 )
 
                 self.agent.buffer.rewards.append(rewards)
-
-                # 【修复核心 1】：录入 step 开始前的状态，确保成功接单的动作被保留！
                 self.agent.buffer.active_flags.append(current_active_flags)
 
                 ep_total_profit += info['step_profit']
@@ -290,15 +290,15 @@ class Trainer:
                     ep_wait_times.append(wait_time)
                     ep_ginis.append(-gini_index)
 
-                    # CSV日志记录 (核心改造 4.3)
                     with open("training_log.csv", "a") as f:
                         f.write(f"{ep},{ep_total_profit:.2f},{completion_rate:.4f},{wait_time:.2f},{gini_index:.4f}\n")
                     break
 
             self.agent.update()
         self.save()
-        self._plot_rewards({"profits": ep_profits, "wait_times": ep_wait_times, "ginis": ep_ginis,
-                            "completion_rates": ep_completion_rates})
+        if show_fig:
+            self._plot_rewards({"profits": ep_profits, "wait_times": ep_wait_times, "ginis": ep_ginis,
+                                "completion_rates": ep_completion_rates})
         k = min(5, len(ep_profits))
         return np.array([np.mean(ep_profits[-k:]), np.mean(ep_wait_times[-k:]), np.mean(ep_ginis[-k:])])
 
@@ -315,31 +315,28 @@ class Trainer:
         plt.close()
 
     def save(self):
-        # --- 【新增】训练结束后保存模型权重 ---
         print("Saving model weights to 'ppo_agent_final.pth'...")
-        torch.save(self.agent.policy.state_dict(), "ppo_agent_final.pth")
+        torch.save(self.agent.policy.state_dict(), "compare_down_alg/ppo_agent_final.pth")
         print("Model saved successfully.")
 
 
 if __name__ == '__main__':
-    # 全局固化随机种子保证复现性
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # 初始化日志表头
     if not os.path.exists("training_log.csv"):
         with open("training_log.csv", "w") as f:
             f.write("Episode,Profit,CompletionRate,WaitTime,Gini\n")
 
     platform_params = {
         'surge': lambda t, no, nd, sd: 1.0 + 1.2 * np.maximum(0, sd - 0.8) ** 1.2,
-        'subsidy': lambda t, no, nd, sd: 3.0 * (np.exp(-50 * (t - 0.30) ** 2) + np.exp(-40 * (t - 0.75) ** 2)) * np.maximum(0, sd - 0.5)
+        'subsidy': lambda t, no, nd, sd: 3.0 * (
+                    np.exp(-50 * (t - 0.30) ** 2) + np.exp(-40 * (t - 0.75) ** 2)) * np.maximum(0, sd - 0.5)
     }
 
     sim_path = 'generator/simulator_driver_nums=400_hex_scaling=0.017031373249357308_weekday.pkl'
     if not os.path.exists(sim_path):
         print(f"Error: Simulator file not found at {sim_path}")
     else:
-
         trainer = Trainer(simulator_path=sim_path)
-        rewards = trainer.train_and_evaluate(platform_params, num_episodes=40)
+        rewards = trainer.train_and_evaluate(platform_params, num_episodes=40, show_fig=True)
