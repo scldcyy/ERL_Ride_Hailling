@@ -282,8 +282,9 @@ class Trainer:
                 if done:
                     total_demand = info['total_generated'] + 1e-6
                     completion_rate = info['total_served'] / total_demand
-                    wait_time = -info['total_wait_time']
-                    gini_index = calculate_gini(info['driver_income_rate'])
+                    avg_wait_time = info['avg_wait_time']
+                    wait_time = -avg_wait_time
+                    gini_index = calculate_gini(info['driver_income'])
 
                     ep_profits.append(ep_total_profit)
                     ep_completion_rates.append(completion_rate)
@@ -291,7 +292,7 @@ class Trainer:
                     ep_ginis.append(-gini_index)
 
                     with open("training_log.csv", "a") as f:
-                        f.write(f"{ep},{ep_total_profit:.2f},{completion_rate:.4f},{wait_time:.2f},{gini_index:.4f}\n")
+                        f.write(f"{ep},{ep_total_profit:.2f},{completion_rate:.4f},{avg_wait_time:.2f},{gini_index:.4f}\n")
                     break
 
             self.agent.update()
@@ -315,8 +316,9 @@ class Trainer:
         plt.close()
 
     def save(self):
-        print("Saving model weights to 'ppo_agent_final.pth'...")
-        torch.save(self.agent.policy.state_dict(), "compare_down_alg/ppo_agent_final.pth")
+        save_path = "compare_down_alg/ppo_agent_final.pth"
+        print(f"Saving model weights to '{save_path}'...")
+        torch.save(self.agent.policy.state_dict(), save_path)
         print("Model saved successfully.")
 
 

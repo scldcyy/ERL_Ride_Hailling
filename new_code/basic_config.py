@@ -7,7 +7,7 @@ CONFIG = {
 
     # PPO Hyperparameters
     'HIDDEN_DIM': 256,
-    'STATE_DIM': 45,  # # 状态维度预估: 中心点(6) + 6邻居(6*6) + 司机属性(3) = 45维。 特征: [lat, lng, orders, drivers, surge, subsidy]
+    'STATE_DIM': 45,
     'ACTION_DIM': 8,
     'LR_ACTOR': 3e-4,
     'LR_CRITIC': 1e-3,
@@ -20,26 +20,26 @@ CONFIG = {
     'MAX_GRAD_NORM': 0.5,
 
     # Economics
-    'BASE_FARE': 2.5,
-    'PRICE_PER_MINUTE': 0.5,
+    'BASE_FARE': 3.0,
+    'PRICE_PER_KM': 1.5,
+    'DISTANCE_TO_KM': 1.60934,  # NYC trip_miles -> km
+    'PRICE_PER_MINUTE': 0.5,    # kept only for backward compatibility
     'OPPORTUNITY_COST_PER_STEP': 0.1,
     'REPOSITION_COST_PER_STEP': 0.2,
     'IDLE_REWARD': -0.05,
     'MIN_FARE_THRESHOLD': 4.0,
-    'MIN_SURGE':1.0,
+    'MIN_SURGE': 1.0,
     'MAX_SURGE': 5.0,
     'MIN_SUBSIDY': 0.0,
     'MAX_SUBSIDY': 20.0,
 
-    # 保存路径相关
     'GENETATE_SAVE_DIR': 'generator',
 }
 
-# --- 新增：司机异质性配置 --
 DRIVER_CONFIG = {
-    'FULL_TIME_RATIO': 0.7,  # 全职司机比例
-    'PART_TIME_INCOME_TARGET': 200,  # 兼职司机日收入目标
-    'FUEL_COST_PER_STEP': 0.1,  # 单位时间油价消耗(c)
-    'PLATFORM_COMMISSION_RATIO': 0.2,  # 平台抽成η
-    'ONLINE_THRESHOLD': 0.05,  # 司机上线的最低预期收益阈值
+    'FULL_TIME_RATIO': 0.7,
+    'PART_TIME_INCOME_TARGET': 200,
+    'FUEL_COST_PER_STEP': 0.1,
+    'PLATFORM_COMMISSION_RATIO': 0.2,
+    'ONLINE_THRESHOLD': 0.05,
 }

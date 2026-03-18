@@ -3,11 +3,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from generate_simulator import PassengerSimulator
 # 引入核心组件
 from basic_config import CONFIG, DRIVER_CONFIG
 from ride_hailing_env import RideHailingEnv
 from shared_ppo import SharedPPOAgent  # 确保 shared_ppo.py 在同一目录下
+from generate_simulator import PassengerSimulator
 
 
 # 组装参数
@@ -17,7 +17,7 @@ platform_params = {
 }
 
 # ==================== 2. 实验核心逻辑 ====================
-def run_comparison_experiment(simulator_path, model_path='ppo_agent_final.pth'):
+def run_comparison_experiment(simulator_path, model_path='compare_down_alg/ppo_agent_final.pth'):
     # 实验设置：不同司机规模
     driver_scales = [500, 1000, 1500, 2000]
 

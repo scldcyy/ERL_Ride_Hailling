@@ -74,8 +74,8 @@ def evaluate_model(agent_name, agent, env, platform_params, num_episodes=5):
             if done:
                 total_demand = info['total_generated'] + 1e-6
                 completion_rate = info['total_served'] / total_demand
-                wait_time = info['total_wait_time'] / (info['total_served'] + 1e-6)
-                gini_index = calculate_gini(info['driver_income_rate'])
+                wait_time = info['avg_wait_time']
+                gini_index = calculate_gini(info['driver_income'])
 
                 ep_profits.append(ep_total_profit)
                 ep_completion_rates.append(completion_rate)

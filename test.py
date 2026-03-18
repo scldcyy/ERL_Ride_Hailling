@@ -1,121 +1,188 @@
-# import matplotlib.pyplot as plt
-# import numpy as np
-#
-#
-# def generate_staircase_convergence(start_val, max_val, steps=50, jump_prob=0.35, step_size_factor=0.3):
-#     """
-#     生成带有真实收敛特征的折线：前期跃升幅度大，后期逐渐趋于平缓停滞。
-#     """
-#     curve = np.zeros(steps)
-#     current_val = start_val
-#     curve[0] = current_val
-#
-#     for i in range(1, steps):
-#         remaining_space = max_val - current_val
-#         if np.random.rand() < jump_prob:
-#             jump = remaining_space * np.random.uniform(step_size_factor * 0.5, step_size_factor * 1.5)
-#             current_val += jump
-#         curve[i] = current_val
-#
-#     return curve
-#
-#
-# def plot_precise_convergence_ablation():
-#     plt.figure(figsize=(10, 6), dpi=120)
-#
-#     # 锁定随机种子，如果想看不同的波动形态，可以修改 42 为其他整数
-#     np.random.seed(42)
-#
-#     evals = np.arange(0, 50)
-#
-#     # --- 1. 模拟数据生成 (核心参数微调) ---
-#
-#     # SAMO-GP (Full): 降低了 step_size_factor (0.45 -> 0.25)，让它稍微多花几代才能达到平稳期
-#     full_model = generate_staircase_convergence(18000, 30200, steps=50, jump_prob=0.35, step_size_factor=0.25)
-#
-#     # SAMO-GP (w/o Warm Start): step_size_factor 砍半 (0.12)，它的收敛速度会显著慢于全模型，呈现一个缓慢拉升的大弧度
-#     no_warm = generate_staircase_convergence(12000, 29500, steps=50, jump_prob=0.35, step_size_factor=0.12)
-#
-#     # GP (w/o GPR Surrogate): 未收敛。通过设置极高的假性 max_val (45000) 和极小的步长，让它到第 50 代依然保持上升趋势
-#     no_surrogate = generate_staircase_convergence(16500, 45000, steps=50, jump_prob=0.28, step_size_factor=0.035)
-#
-#     # Standard GP: 未收敛。同样设置极高 max_val，步长更小，表现为缓慢、艰难的持续爬坡
-#     standard = generate_staircase_convergence(12000, 45000, steps=50, jump_prob=0.20, step_size_factor=0.025)
-#
-#     # --- 2. 绘图设置 ---
-#     m_idx = np.arange(0, 50, 5)
-#
-#     plt.plot(evals, full_model, 'b-', marker='o', markevery=m_idx, label='SAMO-GP (Full Model)', linewidth=2.5,
-#              markersize=7)
-#     plt.plot(evals, no_warm, 'g--', marker='s', markevery=m_idx, label='SAMO-GP (w/o Warm Start)', linewidth=2,
-#              markersize=6)
-#     plt.plot(evals, no_surrogate, 'r-.', marker='^', markevery=m_idx, label='GP (w/o GPR Surrogate)', linewidth=2,
-#              markersize=6)
-#     plt.plot(evals, standard, 'k:', marker='x', markevery=m_idx, label='Standard GP', linewidth=2, markersize=6)
-#
-#     # --- 3. 细节美化 ---
-#     plt.title('Convergence & Ablation Study of Components', fontsize=14, pad=10)
-#     plt.xlabel('Number of Generations / Real Evaluations', fontsize=12)
-#     plt.ylabel('Max Platform Profit', fontsize=12)
-#
-#     plt.ylim(11000, 31000)
-#     plt.xlim(0, 49)
-#
-#     plt.grid(True, linestyle='-', color='lightgray', alpha=0.7)
-#     plt.legend(loc='lower right', fontsize=11, framealpha=0.9, edgecolor='gray')
-#
-#     plt.tight_layout()
-#     plt.savefig(f"1_precise_convergence_ablation.png", dpi=300)
-#
-#
-# plot_precise_convergence_ablation()
-import pickle
-
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as patches
 import numpy as np
-from pymoo.indicators.hv import HV
-
-# with open("results/gp_metrics.pkl", "rb") as f:
-#     data = pickle.load(f)
-#
-# with open("results/de_metrics.pkl", "rb") as f:
-#     data1 = pickle.load(f)
-#
-# with open("results/morl_results.pkl", "rb") as f:
-#     data2 = pickle.load(f)
-#
-# with open("results/morl_results111.pkl", "rb") as f:
-#     data3 = pickle.load(f)
-
-with open("results/test_pareto_fronts.pkl", "rb") as f:
-    data = pickle.load(f)
-data['MARL'][:,0]+=1000
-
-# 初始化 HV 指标计算器
-# 计算并输出 HV 值
 
 
-res_axis0 = np.concatenate([v for v in data.values()], axis=0)
+# 生成模拟数据
+def generate_simulated_results():
+    # 1. 模拟 Pareto 前沿数据 1 (曲线 1)
+    x_p1 = np.linspace(0.1, 10, 50)
+    # 模拟一条负相关曲线，类似于原始图像中的 Pareto 前沿
+    y_p1 = 1 / x_p1 + np.random.normal(0, 0.05, 50)
 
-ref_point = np.array([0, 10000, 1.0])
-ind = HV(ref_point=ref_point)
+    # 2. 模拟另一个 Pareto 前沿数据 2 (曲线 2)
+    x_p2 = np.linspace(0.1, 20, 70)
+    # 模拟另一条具有不同比例和随机噪声的负相关曲线
+    y_p2 = 25 - (x_p2 * 1.1) + np.random.normal(0, 1.2, 70)
 
-for name,front in data.items():
-    F = -np.array(front)
+    # 3. 模拟性能直方图数据 (直方图)
+    # 模拟 5 个类别的性能指标，类似于原始图像中的柱状图
+    categories = ['Quality', 'Efficiency', 'Interpretability', 'Convergence', 'Stability']
+    values = np.random.randint(4, 9, len(categories))  # 随机生成一些性能值
 
-f_max = np.max(F, axis=0)
-f_min = np.min(F, axis=0)
+    return x_p1, y_p1, x_p2, y_p2, categories, values
 
-# 防止分母为0的情况（即某个维度上所有解的值都一样）
-denominator = f_max - f_min
-denominator[denominator == 0] = 1e-9
 
-# 3. 归一化到 [0, 1] 区间
-# 公式: (当前值 - 最小值) / (最大值 - 最小值)
-F_norm = (F - f_min) / denominator
+# 手动绘制神经网络架构图的函数
+def draw_nn_architecture(ax):
+    # 设置图表标题
+    ax.set_title("Lower-layer MARL Behavior (NN)")
+    # 隐藏坐标轴
+    ax.axis('off')
 
-# ref_point = np.max(F_min, axis=0) * 1.1
-hv_value = ind(F_min)
-print(f"{name} 的帕累托前沿的 HV 值为:", hv_value)
-print("该帕累托前沿的 HV 值为:", hv_value)
+    # 定义神经网络的层结构和标签
+    # Input -> Hidden 1 -> Hidden 2 -> Output
+    layer_sizes = [4, 6, 5, 2]  # 输入、隐藏 1、隐藏 2、输出层节点数
+    layer_labels = ['Input', 'Hidden 1', 'Hidden 2', 'Output']
 
-pass
+    # 节点和连接的绘图参数
+    node_radius = 0.25
+    h_spacing = 1.5
+    v_spacing = 0.8
+
+    # 计算所有节点的位置
+    node_positions = []
+    for i, size in enumerate(layer_sizes):
+        x = i * h_spacing
+        y_start = -(size - 1) * v_spacing / 2
+        layer_nodes = []
+        for j in range(size):
+            y = y_start + j * v_spacing
+            layer_nodes.append((x, y))
+        node_positions.append(layer_nodes)
+
+    # 绘制层与层之间的连接（所有节点对）
+    for i in range(len(layer_sizes) - 1):
+        curr_layer = node_positions[i]
+        next_layer = node_positions[i + 1]
+        for curr_node in curr_layer:
+            for next_node in next_layer:
+                line = plt.Line2D([curr_node[0], next_node[0]],
+                                  [curr_node[1], next_node[1]],
+                                  color='gray', alpha=0.3, lw=1)
+                ax.add_line(line)
+
+    # 绘制节点和标签
+    colors = plt.cm.plasma(np.linspace(0.2, 0.8, len(layer_sizes)))  # 使用调色板
+    for i, (layer_nodes, size) in enumerate(zip(node_positions, layer_sizes)):
+        color = colors[i]
+        for j, node in enumerate(layer_nodes):
+            # 绘制节点作为圆圈
+            circle = patches.Circle(node, radius=node_radius, edgecolor='black', facecolor=color, alpha=0.7)
+            ax.add_patch(circle)
+
+            # 为某些节点添加 ID 标签（可选，类似于原始图像）
+            if i == 0 and j == 0:
+                ax.text(node[0], node[1], 's₁', ha='center', va='center', fontweight='bold', color='white')
+            if i == len(layer_sizes) - 1 and j == 1:
+                ax.text(node[0], node[1], 'a₁', ha='center', va='center', fontweight='bold', color='white')
+
+        # 添加层标签
+        ax.text(layer_nodes[0][0], layer_nodes[-1][1] - node_radius * 3, layer_labels[i], ha='center', va='top',
+                fontweight='bold')
+
+    # 添加 MARL 特有的反馈循环
+    # 从一个输出节点到中间层（隐藏 2）
+    out_node = node_positions[3][1]  # 使用第二个输出节点 'a₁'
+    h2_node = node_positions[2][2]  # 使用中间的一个隐藏 2 节点
+
+    # 使用弯曲的箭头绘制反馈循环
+    loop_arrow = patches.FancyArrowPatch((out_node[0] + node_radius * 1.2, out_node[1]),
+                                         (h2_node[0] - node_radius * 1.2, h2_node[1]),
+                                         connectionstyle="arc3,rad=-0.7",  # 弯曲程度
+                                         arrowstyle="->,head_length=5,head_width=3",
+                                         color='purple', mutation_scale=20, lw=2, linestyle='dashed')
+    ax.add_patch(loop_arrow)
+    ax.text(h2_node[0] + (out_node[0] - h2_node[0]) / 2, out_node[1] - 0.3, "Policy\nFeedback", color='purple',
+            ha='center')
+
+    # 在输出节点附近绘制一个代表性的智能体图标（就像原始图像一样）
+    agent_loc = (out_node[0] + 0.8, out_node[1])
+    # 绘制一个简单的多边形作为智能体标记
+    agent_marker = patches.RegularPolygon(agent_loc, 3, radius=0.4, edgecolor='black', facecolor='white',
+                                          orientation=np.pi / 6, alpha=0.5)
+    ax.add_patch(agent_marker)
+    ax.text(agent_loc[0], agent_loc[1] - 0.5, "Agent₁\n(MARL)", ha='center')
+
+    # 设置边界以确保所有内容可见
+    ax.set_xlim(-0.5, h_spacing * (len(layer_sizes) - 1) + 1.5)
+    ax.set_ylim(-3.5, 3.5)
+    # 确保节点是圆的
+    ax.set_aspect('equal')
+
+
+def main():
+    # 生成模拟数据
+    x_p1, y_p1, x_p2, y_p2, categories, values = generate_simulated_results()
+
+    # 创建 Gridspec 布局以垂直堆叠子图，并根据内容调整高度
+    fig = plt.figure(figsize=(12, 16))
+    # 4 行 1 列，神经网络图的高度比例较大
+    gs = gridspec.GridSpec(4, 1, height_ratios=[1, 1, 1, 1.5])
+    plt.subplots_adjust(hspace=0.4)  # 增加子图间距
+
+    # 1. Pareto Front Analysis (曲线图 1)
+    ax1 = fig.add_subplot(gs[0])
+    # 绘制线图
+    ax1.plot(x_p1, y_p1, 'o-', color='tab:blue', label='Front A')
+    ax1.set_title("Theoretical Pareto Front Analysis")
+    ax1.set_xlabel("Objective 1 (e.g., Cost)")
+    ax1.set_ylabel("Objective 2 (e.g., Stability)")
+    ax1.grid(True)
+    ax1.legend()
+
+    # 2. Experimental Verification (曲线图 2 - 散点图)
+    ax2 = fig.add_subplot(gs[1])
+    # 绘制散点图
+    ax2.scatter(x_p2, y_p2, color='tab:orange', label='Front B')
+    ax2.set_title("Experimental Pareto Front Verification")
+    ax2.set_xlabel("Objective 1 (e.g., Efficiency)")
+    ax2.set_ylabel("Objective 2 (e.g., Interpretability)")
+    ax2.grid(True)
+    ax2.legend()
+
+    # 3. Performance Metrics (直方图)
+    ax3 = fig.add_subplot(gs[2])
+    # 绘制柱状图，并使用颜色映射
+    rects = ax3.bar(categories, values, color=plt.cm.viridis(np.linspace(0.3, 0.7, len(categories))))
+    ax3.set_title("Multi-Objective Performance Comparison")
+    ax3.set_ylabel("Normalized Score")
+    ax3.set_xlabel("Performance Metrics")
+    # 设置 Y 轴范围以提供空间
+    ax3.set_ylim(0, 10)
+
+    # 为每个柱子添加值标签
+    for rect in rects:
+        height = rect.get_height()
+        ax3.annotate('{}'.format(height),
+                     xy=(rect.get_x() + rect.get_width() / 2, height),
+                     xytext=(0, 3),  # 3 点垂直偏移
+                     textcoords="offset points",
+                     ha='center', va='bottom')
+    # 稍微旋转类别标签以避免重叠
+    ax3.set_xticklabels(categories, rotation=15)
+
+    # 4. Neural Network Architecture (神经网络图)
+    ax4 = fig.add_subplot(gs[3])
+    # 调用绘制神经网络的函数
+    draw_nn_architecture(ax4)
+
+    # 添加一个总标题（类似于原始图像）
+    fig.suptitle("Simulated Methodology for Verification (Based on Input Image)", fontsize=16, fontweight='bold',
+                 y=0.98)
+
+    # 调整布局以适应总标题
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    # 在交互式环境中运行（如果适用）
+    # plt.show() 
+
+    # 保存图像
+    output_filename = "simulated_right_charts.png"
+    plt.savefig(output_filename)
+    print(f"图像已成功生成并保存为 '{output_filename}'。")
+
+
+if __name__ == "__main__":
+    main()

@@ -67,7 +67,7 @@ def train_agent(agent_name, agent_class, simulator_path, platform_params, num_ep
             if done:
                 total_demand = info['total_generated'] + 1e-6
                 completion_rate = info['total_served'] / total_demand
-                gini_index = calculate_gini(info['driver_income_rate'])
+                gini_index = calculate_gini(info['driver_income'])
 
                 ep_profits.append(ep_total_profit)
                 ep_completion_rates.append(completion_rate)
